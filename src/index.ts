@@ -7,9 +7,11 @@ import { deployAcl, validateAcl } from "./cli.js";
 import { filterTools, PROFILES, parseReadonlyFlag } from "./filter.js";
 import {
   buildToolGroups,
+  buildToolMeta,
   formatBannerFilterSuffix,
   formatTailnetMismatchWarning,
   isLocalCliEnabled,
+  isRequireApprovalEnabled,
   tailnetAclResource,
   tailnetDevicesResource,
   tailnetDnsResource,
@@ -158,9 +160,34 @@ if (!cliSubcommandHandled) {
     version,
   });
 
-  // Register all tools with annotations
+  // Register all tools with annotations.
+  //
+  // registerTool, NOT the legacy server.tool(): all six tool() overloads are
+  // @deprecated in SDK 1.29, and the implementation hardcodes both `title` and
+  // `_meta` to undefined when it builds the registry entry -- so neither can
+  // reach tools/list through that path, no matter what is passed in.
+  // registerTool destructures both from its config and forwards them, and the
+  // tools/list handler emits `_meta: tool._meta`. The SDK says as much in its
+  // own comment on tool(): "Support for this style is frozen as of protocol
+  // version 2025-03-26. Future additions to tool definition should *NOT* be
+  // added."
+  const requireApproval = isRequireApprovalEnabled(process.env);
   for (const tool of allTools) {
-    server.tool(tool.name, tool.description, tool.inputSchema.shape, tool.annotations, wrapToolHandler(tool));
+    server.registerTool(
+      tool.name,
+      {
+        // Hoisted out of annotations.title, which every tool file already sets.
+        // The annotations copy deliberately stays where it is: clients reading
+        // the legacy location keep working, so this is purely additive on the
+        // wire rather than a move.
+        title: tool.annotations.title,
+        description: tool.description,
+        inputSchema: tool.inputSchema.shape,
+        annotations: tool.annotations,
+        _meta: buildToolMeta(tool.name, { requireApproval }),
+      },
+      wrapToolHandler(tool),
+    );
   }
 
   // Register MCP Resources
@@ -171,28 +198,28 @@ if (!cliSubcommandHandled) {
   //   string like "error" in a numeric slot.
   // - HuJSON resource (acl): failure emits a `//` comment header so the body remains parseable as HuJSON.
 
-  server.resource(
+  server.registerResource(
     "tailnet-status",
     "tailscale://tailnet/status",
     { description: "Current tailnet status including device count and settings", mimeType: "application/json" },
     tailnetStatusResource,
   );
 
-  server.resource(
+  server.registerResource(
     "tailnet-devices",
     "tailscale://tailnet/devices",
     { description: "List of all devices in the tailnet with their status", mimeType: "application/json" },
     tailnetDevicesResource,
   );
 
-  server.resource(
+  server.registerResource(
     "tailnet-acl",
     "tailscale://tailnet/acl",
     { description: "Current ACL policy (HuJSON with comments preserved)", mimeType: "application/hujson" },
     tailnetAclResource,
   );
 
-  server.resource(
+  server.registerResource(
     "tailnet-dns",
     "tailscale://tailnet/dns",
     {

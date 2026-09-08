@@ -106,12 +106,13 @@ That's it. Now ask your agent:
 
 96 tools is a lot. If you've already got a dozen MCP servers and your client is feeling heavy, trim what this one exposes. Three knobs, combinable:
 
+> The `env` blocks below show only the variable under discussion. Your credentials come from the environment, as set in [Quick start](#quick-start) — keep them in your shell profile rather than in the client's JSON config, which is world-readable on most systems and easy to commit by accident.
+
 ### Option 1: `TAILSCALE_PROFILE` (preset, easiest)
 
 ```json
 {
   "env": {
-    "TAILSCALE_API_KEY": "tskey-api-...",
     "TAILSCALE_PROFILE": "core"
   }
 }
@@ -126,7 +127,6 @@ That's it. Now ask your agent:
 ```json
 {
   "env": {
-    "TAILSCALE_API_KEY": "tskey-api-...",
     "TAILSCALE_TOOLS": "devices,acl,dns,audit"
   }
 }
@@ -141,7 +141,6 @@ Valid group names: `status`, `devices`, `acl`, `dns`, `keys`, `users`, `tailnet`
 ```json
 {
   "env": {
-    "TAILSCALE_API_KEY": "tskey-api-...",
     "TAILSCALE_PROFILE": "core",
     "TAILSCALE_READONLY": "1"
   }
@@ -167,6 +166,40 @@ When both `TAILSCALE_PROFILE` and `TAILSCALE_TOOLS` are set, `TAILSCALE_TOOLS` w
 The "(overridden)" marker only fires for substantive profiles (`minimal` / `core`); `profile=full` is a no-op preset, so it's shown without the marker when `TAILSCALE_TOOLS` is also set.
 
 If you don't set any filter, startup prints a tip pointing you at the profiles.
+
+## Requiring approval on irreversible tools
+
+`readOnlyHint` / `destructiveHint` are *advisory* — the MCP spec says clients MUST treat annotations as untrusted, and most don't gate on them. `TAILSCALE_REQUIRE_APPROVAL=1` adds a stronger signal that supported clients enforce:
+
+```json
+{
+  "env": {
+    "TAILSCALE_REQUIRE_APPROVAL": "1"
+  }
+}
+```
+
+Nine tools are then advertised with `_meta["anthropic/requiresUserInteraction"]`, which forces a confirmation prompt even when an allow-rule would otherwise auto-approve the call:
+
+| Tool | Why it's on the list |
+|---|---|
+| `tailscale_update_acl` | Can lock every device out of the tailnet; the previous HuJSON (comments included) is gone unless you captured it |
+| `tailscale_delete_device` | The device must re-enroll |
+| `tailscale_delete_user` | No undelete |
+| `tailscale_delete_tailnet` | Destroys an entire tailnet |
+| `tailscale_delete_key` | The secret is never returned again |
+| `tailscale_delete_oauth_app` | Same |
+| `tailscale_delete_webhook` | Same |
+| `tailscale_delete_log_stream_config` | Same |
+| `tailscale_delete_posture_integration` | Same |
+
+The line drawn is **"this server cannot undo it with information you still hold"**, which is narrower than the 23 tools annotated `destructiveHint: true`. `tailscale_suspend_user` is deliberately *excluded* — `tailscale_restore_user` reverses it. So are `tailscale_deauthorize_device` (reversed by `tailscale_authorize_device`) and the replace-all setters, which all have a `get_*` counterpart you can read before writing.
+
+**Opt-in on purpose, and read this before turning it on.** In a client mode that never prompts (an unattended agent, a CI run), the flag causes those calls to be **denied** rather than run. That is the right default when a human is at the keyboard and the wrong one when nobody is, so it stays off unless you set it.
+
+Requires a client that honors the annotation; Claude Code added support in v2.1.199. Clients that don't recognize it ignore it, so setting the variable is never worse than leaving it off.
+
+Separately and always on, five tools whose response size scales with the tailnet rather than with the request — `tailscale_list_devices`, `tailscale_list_users`, `tailscale_get_acl`, `tailscale_get_audit_log`, `tailscale_get_network_flow_logs` — declare `_meta["anthropic/maxResultSizeChars"]`, so a large-but-legitimate result stays inline instead of being truncated into a file reference the agent has to read back mid-task.
 
 ## Using with mcp.hosting / mcph
 
@@ -553,8 +586,7 @@ It is opt-in rather than default because a wrong grant does not fail loudly. oam
   "mcpServers": {
     "tailscale": {
       "command": "oam",
-      "args": ["run", "/path/to/tailscale-mcp/dist/index.js"],
-      "env": { "TAILSCALE_API_KEY": "tskey-api-..." }
+      "args": ["run", "/path/to/tailscale-mcp/dist/index.js"]
     }
   }
 }

@@ -33,7 +33,7 @@ import { PROFILES } from "./filter.js";
 // module-load error anywhere under src/tools/ now fails THIS suite too, and
 // the failure reads as a startup-banner problem. If this file fails
 // unexpectedly, check that src/tools/*.ts loads first.
-import { buildToolGroups } from "./server-wiring.js";
+import { buildToolGroups, FORCED_APPROVAL_TOOLS, LARGE_RESULT_TOOLS, MAX_RESULT_SIZE_CHARS } from "./server-wiring.js";
 
 // The compiled test sits in dist/ alongside the bundle it spawns. Resolving via
 // import.meta.url (not process.cwd()) keeps this working under any runner.
@@ -163,7 +163,7 @@ interface JsonRpcResponse {
 /** What one MCP session hands back to the assertions below. */
 interface McpSession {
   serverInfo: { name?: string; version?: string };
-  tools: Array<{ name: string }>;
+  tools: Array<{ name: string; title?: string; _meta?: Record<string, unknown> }>;
   resources: Array<{ name: string; uri: string; mimeType?: string }>;
 }
 
@@ -479,12 +479,83 @@ describe("MCP protocol surface", () => {
     // above makes on the banner, tightened one notch and taken at the layer a
     // client actually reads. A count alone cannot see a rename or a swap; this
     // can, and it also pins that the name argument stayed in first position of
-    // index.ts's server.tool(name, description, shape, annotations, handler)
-    // call, which nothing else in the repo reads.
+    // index.ts's server.registerTool(name, config, handler) call, which nothing
+    // else in the repo reads.
     assert.deepEqual(
       session.tools.map((t) => t.name).sort(),
       registryToolNames({}),
       "tools/list disagrees with the tool registry",
     );
+  });
+});
+
+describe("tool _meta over a live session", () => {
+  // These assert against the SPAWNED BUNDLE, not the tsc copy the unit tests
+  // import. That distinction is the whole point: buildToolMeta can be perfect
+  // while index.ts forgets to pass `_meta` to registerTool, or while a future
+  // edit reverts to the legacy server.tool() -- which silently drops `_meta`
+  // and `title` on the floor rather than failing. Only a real tools/list can
+  // see that, and nothing else in the repo reads it.
+  const APPROVAL_KEY = "anthropic/requiresUserInteraction";
+  const SIZE_KEY = "anthropic/maxResultSizeChars";
+
+  it("carries the approval flag on exactly the forced set when the gate is on", { timeout: 30_000 }, async () => {
+    const session = await conductMcpSession({ ...API_KEY, TAILSCALE_REQUIRE_APPROVAL: "1" });
+    const flagged = session.tools
+      .filter((t) => t._meta?.[APPROVAL_KEY] === true)
+      .map((t) => t.name)
+      .sort();
+    assert.deepEqual(
+      flagged,
+      [...FORCED_APPROVAL_TOOLS].sort(),
+      "the tools a client is told it must never auto-approve drifted from FORCED_APPROVAL_TOOLS",
+    );
+  });
+
+  it("omits the approval flag from every tool when the gate is off", { timeout: 30_000 }, async () => {
+    // The default. A regression that flipped this on would deny these calls
+    // outright for every unattended agent, which is worse than the gap it fixes.
+    const session = await conductMcpSession({ ...API_KEY });
+    const flagged = session.tools.filter((t) => t._meta?.[APPROVAL_KEY] !== undefined).map((t) => t.name);
+    assert.deepEqual(flagged, [], "forced approval must be strictly opt-in");
+  });
+
+  it("declares the size cap on exactly the large-result set, gate independent", { timeout: 30_000 }, async () => {
+    const envs: Array<Record<string, string>> = [{ ...API_KEY }, { ...API_KEY, TAILSCALE_REQUIRE_APPROVAL: "1" }];
+    for (const env of envs) {
+      const session = await conductMcpSession(env);
+      const capped = session.tools.filter((t) => t._meta?.[SIZE_KEY] !== undefined);
+      assert.deepEqual(
+        capped.map((t) => t.name).sort(),
+        [...LARGE_RESULT_TOOLS].sort(),
+        `size caps drifted (TAILSCALE_REQUIRE_APPROVAL=${env.TAILSCALE_REQUIRE_APPROVAL ?? "unset"})`,
+      );
+      for (const tool of capped) {
+        const value = tool._meta?.[SIZE_KEY];
+        assert.equal(typeof value, "number", `${tool.name} must declare a numeric cap`);
+        assert.ok(
+          Number.isInteger(value) && (value as number) > 0 && (value as number) <= 500_000,
+          `${tool.name} cap ${String(value)} is outside the accepted range; above the ceiling it is ignored`,
+        );
+        assert.equal(value, MAX_RESULT_SIZE_CHARS);
+      }
+    }
+  });
+
+  it("populates the top-level title, which the legacy registration could not", { timeout: 30_000 }, async () => {
+    // The observable win of the registerTool migration. server.tool() hardcodes
+    // title to undefined when it builds the registry entry, so before the
+    // migration every tool advertised `title: undefined` no matter what its
+    // annotations said. A revert would blank this out.
+    const session = await conductMcpSession({ ...API_KEY });
+    const untitled = session.tools.filter((t) => typeof t.title !== "string" || t.title.length === 0);
+    assert.deepEqual(
+      untitled.map((t) => t.name),
+      [],
+      "every tool sets annotations.title; all of them should surface",
+    );
+
+    const listDevices = session.tools.find((t) => t.name === "tailscale_list_devices");
+    assert.equal(listDevices?.title, "List devices", "title must come from the tool's own annotations");
   });
 });

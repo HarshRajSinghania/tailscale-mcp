@@ -3,9 +3,14 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { PROFILES } from "./filter.js";
 import {
   buildToolGroups,
+  buildToolMeta,
+  FORCED_APPROVAL_TOOLS,
   formatBannerFilterSuffix,
   formatTailnetMismatchWarning,
   isLocalCliEnabled,
+  isRequireApprovalEnabled,
+  LARGE_RESULT_TOOLS,
+  MAX_RESULT_SIZE_CHARS,
   tailnetAclResource,
   tailnetDevicesResource,
   tailnetDnsResource,
@@ -742,5 +747,170 @@ describe("formatTailnetMismatchWarning", () => {
     assert.match(msg, /api-only-1/);
     assert.match(msg, /example\.com/);
     assert.match(msg, /403/);
+  });
+});
+
+describe("isRequireApprovalEnabled", () => {
+  // Case-sensitive "1" | "true", the same contract as isLocalCliEnabled and
+  // parseReadonlyFlag. Pinned because a third spelling rule here would be the
+  // kind of inconsistency an operator only discovers when the gate silently
+  // does nothing.
+  it("accepts exactly the two documented truthy spellings", () => {
+    assert.equal(isRequireApprovalEnabled({ TAILSCALE_REQUIRE_APPROVAL: "1" }), true);
+    assert.equal(isRequireApprovalEnabled({ TAILSCALE_REQUIRE_APPROVAL: "true" }), true);
+  });
+
+  it("rejects everything else, including near-misses and casing variants", () => {
+    for (const value of ["", " ", "0", "false", "yes", "TRUE", "True", "on", "1 "]) {
+      assert.equal(
+        isRequireApprovalEnabled({ TAILSCALE_REQUIRE_APPROVAL: value }),
+        false,
+        `${JSON.stringify(value)} must not enable forced approval`,
+      );
+    }
+  });
+
+  it("defaults to off when the variable is unset", () => {
+    // The load-bearing default: a client in a never-prompt mode DENIES a tool
+    // carrying requiresUserInteraction, so defaulting this on would break
+    // unattended agents on upgrade.
+    assert.equal(isRequireApprovalEnabled({}), false);
+  });
+});
+
+describe("forced-approval and large-result tool sets", () => {
+  const allTools = Object.values(buildToolGroups({ TAILSCALE_LOCAL_CLI: "1" })).flat();
+  const byName = new Map(allTools.map((t) => [t.name, t]));
+
+  it("names exactly the tools this server cannot undo", () => {
+    // A NAME-PINNED literal, deliberately not derived from annotations. Deriving
+    // it would make this test agree with whatever destructiveHint happens to
+    // say, which is precisely the drift it exists to catch -- and once
+    // TAILSCALE_WRITE_POLICY treats destructiveHint as a security boundary, a
+    // new tool with a missing annotation must fail a test rather than silently
+    // widen a gate.
+    assert.deepEqual(
+      [...FORCED_APPROVAL_TOOLS],
+      [
+        "tailscale_delete_device",
+        "tailscale_delete_key",
+        "tailscale_delete_log_stream_config",
+        "tailscale_delete_oauth_app",
+        "tailscale_delete_posture_integration",
+        "tailscale_delete_tailnet",
+        "tailscale_delete_user",
+        "tailscale_delete_webhook",
+        "tailscale_update_acl",
+      ],
+      "the forced-approval set changed -- removing an entry is a breaking change for operators relying on the prompt",
+    );
+  });
+
+  it("keeps both lists alphabetised so an omission is easy to spot", () => {
+    for (const [label, list] of [
+      ["FORCED_APPROVAL_TOOLS", FORCED_APPROVAL_TOOLS],
+      ["LARGE_RESULT_TOOLS", LARGE_RESULT_TOOLS],
+    ] as const) {
+      assert.deepEqual([...list].sort(), [...list], `${label} must stay sorted`);
+    }
+  });
+
+  it("references only tools that actually exist in the registry", () => {
+    // Guards the rename case: a tool renamed in its own file would otherwise
+    // leave a dead string here, silently dropping it from the gate.
+    for (const name of [...FORCED_APPROVAL_TOOLS, ...LARGE_RESULT_TOOLS]) {
+      assert.ok(byName.has(name), `${name} is listed but not registered`);
+    }
+  });
+
+  it("forces approval only on tools already annotated destructive", () => {
+    // The set is a strict subset of destructiveHint:true. If an entry here is
+    // not destructive, one of the two is wrong.
+    for (const name of FORCED_APPROVAL_TOOLS) {
+      assert.equal(
+        byName.get(name)?.annotations.destructiveHint,
+        true,
+        `${name} is force-approved but not annotated destructive`,
+      );
+    }
+  });
+
+  it("excludes reversible destructive tools, suspend_user above all", () => {
+    // suspend_user has restore_user, so it fails the stated criterion (this
+    // server can undo it). It was on the original shortlist; this pins the
+    // decision so a later edit has to argue with the criterion, not drift past
+    // it. Same for the three whose inverse also ships here.
+    for (const name of [
+      "tailscale_suspend_user",
+      "tailscale_deauthorize_device",
+      "tailscale_set_devices_authorized",
+      "tailscale_delete_device_posture_attribute",
+    ]) {
+      assert.ok(byName.has(name), `${name} should still exist -- update this test if it was renamed`);
+      assert.ok(
+        !FORCED_APPROVAL_TOOLS.includes(name),
+        `${name} is reversible in-server and must not be force-approved`,
+      );
+    }
+    assert.ok(byName.has("tailscale_restore_user"), "restore_user is why suspend_user is excluded");
+  });
+
+  it("declares large results only on read-only tools", () => {
+    for (const name of LARGE_RESULT_TOOLS) {
+      assert.equal(
+        byName.get(name)?.annotations.readOnlyHint,
+        true,
+        `${name} raises a result-size cap but is not read-only`,
+      );
+    }
+  });
+
+  it("keeps the size cap a positive integer within the client ceiling", () => {
+    assert.ok(Number.isInteger(MAX_RESULT_SIZE_CHARS), "must be an integer");
+    assert.ok(MAX_RESULT_SIZE_CHARS > 0, "must be positive");
+    assert.ok(MAX_RESULT_SIZE_CHARS <= 500_000, "values above the client ceiling are ignored");
+  });
+});
+
+describe("buildToolMeta", () => {
+  const APPROVAL_KEY = "anthropic/requiresUserInteraction";
+  const SIZE_KEY = "anthropic/maxResultSizeChars";
+
+  it("omits the approval flag entirely when the gate is off", () => {
+    // Not `false` -- absent. A literal false is a value the client would have
+    // to interpret, and the contract is "only true means anything".
+    const meta = buildToolMeta("tailscale_update_acl", { requireApproval: false });
+    assert.equal(meta, undefined, "update_acl carries no other meta, so the whole object should be omitted");
+  });
+
+  it("emits the JSON boolean true when the gate is on", () => {
+    const meta = buildToolMeta("tailscale_update_acl", { requireApproval: true });
+    assert.deepEqual(meta, { [APPROVAL_KEY]: true });
+    // Any other value is ignored client-side, so the type matters as much as
+    // the presence.
+    assert.equal(typeof meta?.[APPROVAL_KEY], "boolean");
+  });
+
+  it("declares the size cap regardless of the approval gate", () => {
+    for (const requireApproval of [false, true]) {
+      assert.equal(
+        buildToolMeta("tailscale_list_devices", { requireApproval })?.[SIZE_KEY],
+        MAX_RESULT_SIZE_CHARS,
+        `size cap must not depend on requireApproval=${requireApproval}`,
+      );
+    }
+  });
+
+  it("returns undefined for a tool in neither set", () => {
+    assert.equal(buildToolMeta("tailscale_get_device", { requireApproval: true }), undefined);
+  });
+
+  it("returns a fresh object per call", () => {
+    // _meta reaches the SDK registry by reference and is echoed into every
+    // tools/list, so a shared literal would let one mutation leak across tools.
+    const a = buildToolMeta("tailscale_list_devices", { requireApproval: true });
+    const b = buildToolMeta("tailscale_list_devices", { requireApproval: true });
+    assert.notEqual(a, b, "must not hand out the same object twice");
+    assert.deepEqual(a, b);
   });
 });
