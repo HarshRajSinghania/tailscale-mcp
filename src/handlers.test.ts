@@ -4518,3 +4518,593 @@ describe("Tool handlers", () => {
     });
   });
 });
+
+/**
+ * tailscale_diff_acl_access.
+ *
+ * Its own describe block rather than a case inside "Tool handlers": every test
+ * here needs a fetch stub that routes by URL *and* request body (the two
+ * preview calls per principal hit an identical URL and differ only by the
+ * policy they carry), which is a different harness from the single-response
+ * mocks above.
+ *
+ * Fixtures follow the shape the preview endpoint actually returns -- Go's
+ * ACLPreviewResponse{Matches []UserRuleMatch, Type, PreviewFor}, where a match
+ * carries users/ports/lineNumber/via/postures. Inventing a friendlier shape
+ * here would produce tests that pass against a response Tailscale never sends.
+ */
+describe("tailscale_diff_acl_access", () => {
+  const originalFetch = globalThis.fetch;
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    process.env.TAILSCALE_API_KEY = "tskey-api-test";
+    process.env.TAILSCALE_TAILNET = "test.ts.net";
+    delete process.env.TAILSCALE_OAUTH_CLIENT_ID;
+    delete process.env.TAILSCALE_OAUTH_CLIENT_SECRET;
+    globalThis.fetch = async () => mockFetchResponse(599, "no test installed a fetch stub");
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
+  });
+
+  const BASELINE = '{"acls":[{"action":"accept","src":["alice@example.com"],"dst":["tag:prod:22"]}]}';
+
+  /** A preview response in the real wire shape. */
+  function preview(matches: Array<Record<string, unknown>>, previewFor: string) {
+    return { matches, type: "user", previewFor };
+  }
+
+  /**
+   * Route GET /acl, GET /users, and POST /acl/preview. `onPreview` receives the
+   * policy text the call carried and the principal it was for, so a test can
+   * return different rules for the baseline vs the proposed policy -- the only
+   * thing distinguishing the two requests.
+   */
+  function installFetch(opts: {
+    users?: Array<Record<string, unknown>>;
+    usersStatus?: number;
+    aclStatus?: number;
+    onPreview: (policy: string, principal: string) => { status?: number; body: unknown };
+  }) {
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/acl/preview")) {
+        const principal = new URL(url).searchParams.get("previewFor") ?? "";
+        const result = opts.onPreview((init?.body as string) ?? "", principal);
+        return mockFetchResponse(result.status ?? 200, result.body);
+      }
+      if (url.includes("/users")) {
+        return mockFetchResponse(opts.usersStatus ?? 200, { users: opts.users ?? [] });
+      }
+      if (url.includes("/acl")) {
+        return mockFetchResponse(opts.aclStatus ?? 200, BASELINE);
+      }
+      return mockFetchResponse(599, "unexpected URL in test");
+    };
+  }
+
+  async function runDiff(input: Record<string, unknown>) {
+    const { aclTools } = await import("./tools/acl.js");
+    return (await findTool(aclTools, "tailscale_diff_acl_access").handler(input)) as {
+      ok: boolean;
+      error?: string;
+      data?: {
+        summary: string;
+        principalsCompared: number;
+        principalsFailed: number;
+        principalsAvailable: number;
+        truncated: boolean;
+        scope: string;
+        changed: Array<{ principal: string; lost: string[]; gained: string[] }>;
+        unchanged: string[];
+        failed: Array<{ principal: string; error: string }>;
+      };
+    };
+  }
+
+  it("reports what a user loses when the proposed policy revokes a destination", async () => {
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE
+          ? { body: preview([{ users: [principal], ports: ["tag:prod:22", "tag:db:5432"], lineNumber: 3 }], principal) }
+          : { body: preview([{ users: [principal], ports: ["tag:prod:22"], lineNumber: 3 }], principal) },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.data?.changed, [{ principal: "alice@example.com", lost: ["tag:db:5432"], gained: [] }]);
+    assert.deepEqual(res.data?.unchanged, []);
+    assert.match(res.data?.summary ?? "", /^1 of 1 users compared lose access/);
+  });
+
+  it("reports what a user gains on an additive change", async () => {
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE
+          ? { body: preview([{ ports: ["tag:prod:22"], lineNumber: 3 }], principal) }
+          : { body: preview([{ ports: ["tag:prod:22", "tag:new:443"], lineNumber: 3 }], principal) },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.deepEqual(res.data?.changed, [{ principal: "alice@example.com", lost: [], gained: ["tag:new:443"] }]);
+    assert.match(res.data?.summary ?? "", /0 of 1 users compared lose access, 1 gain access/);
+  });
+
+  it("reports no change when the policies grant the same access", async () => {
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (_policy, principal) => ({ body: preview([{ ports: ["tag:prod:22"], lineNumber: 3 }], principal) }),
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.deepEqual(res.data?.changed, []);
+    assert.deepEqual(res.data?.unchanged, ["alice@example.com"]);
+  });
+
+  it("does not treat a moved rule as an access change", async () => {
+    // lineNumber is the rule's position in the policy text. Inserting a comment
+    // at the top shifts every rule below it; keying the diff on lineNumber would
+    // report the entire tailnet as losing and re-gaining all access on a
+    // whitespace edit, which is the fastest way to make the tool ignorable.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE
+          ? { body: preview([{ ports: ["tag:prod:22"], lineNumber: 3 }], principal) }
+          : { body: preview([{ ports: ["tag:prod:22"], lineNumber: 47 }], principal) },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.deepEqual(res.data?.changed, [], "a line-number shift is not an access change");
+    assert.deepEqual(res.data?.unchanged, ["alice@example.com"]);
+  });
+
+  it("does not treat a narrowed src list as a change for a user who stays in it", async () => {
+    // `users` on a match is the rule's SOURCE set. Dropping bob from
+    // src:[alice,bob] leaves alice's reachable destinations identical; keying on
+    // it would show alice both losing and gaining the same access.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE
+          ? {
+              body: preview(
+                [{ users: ["alice@example.com", "bob@example.com"], ports: ["tag:prod:22"], lineNumber: 3 }],
+                principal,
+              ),
+            }
+          : { body: preview([{ users: ["alice@example.com"], ports: ["tag:prod:22"], lineNumber: 3 }], principal) },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.deepEqual(res.data?.changed, []);
+    assert.deepEqual(res.data?.unchanged, ["alice@example.com"]);
+  });
+
+  it("distinguishes access qualified by via and posture", async () => {
+    // Reaching a destination only through a relay is a different grant from
+    // reaching it directly, so this is correctly BOTH a loss and a gain.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE
+          ? { body: preview([{ ports: ["tag:prod:22"], lineNumber: 1 }], principal) }
+          : { body: preview([{ ports: ["tag:prod:22"], via: ["tag:relay"], lineNumber: 1 }], principal) },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.deepEqual(res.data?.changed, [
+      { principal: "alice@example.com", lost: ["tag:prod:22"], gained: ["tag:prod:22 via tag:relay"] },
+    ]);
+  });
+
+  it("never reports a failed preview as lost access", async () => {
+    // The single worst way this tool could lie. If the proposed-policy preview
+    // fails and the baseline succeeds, an empty match set would render as
+    // "loses everything" -- a fabricated total revocation that would either
+    // block a safe change or, worse, be dismissed as noise.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }, { loginName: "bob@example.com" }],
+      onPreview: (policy, principal) => {
+        if (principal === "alice@example.com" && policy !== BASELINE) {
+          return { status: 500, body: { message: "preview backend exploded" } };
+        }
+        return { body: preview([{ ports: ["tag:prod:22"], lineNumber: 1 }], principal) };
+      },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.deepEqual(res.data?.changed, [], "a failed preview must not become a finding");
+    assert.deepEqual(res.data?.unchanged, ["bob@example.com"]);
+    assert.equal(res.data?.failed.length, 1);
+    assert.equal(res.data?.failed[0].principal, "alice@example.com");
+    assert.match(res.data?.failed[0].error ?? "", /proposed policy failed/);
+    assert.match(res.data?.summary ?? "", /^1 of 2 users could not be checked/);
+  });
+
+  it("treats an unparseable preview body as a failure, not an empty rule set", async () => {
+    // Two principals so one still compares: with only the failing one, the
+    // run compares nobody and correctly becomes a hard error, which would test
+    // that guard rather than the parse handling this case is about.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }, { loginName: "bob@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE || principal === "bob@example.com"
+          ? { body: preview([{ ports: ["tag:prod:22"], lineNumber: 1 }], principal) }
+          : { body: "<html>gateway error</html>" },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.deepEqual(res.data?.changed, []);
+    assert.equal(res.data?.failed.length, 1);
+    assert.match(res.data?.failed[0].error ?? "", /not valid JSON/);
+  });
+
+  it("treats a response with no matches array as a failure, not total revocation", async () => {
+    // A response-shape change would otherwise read as "every principal can
+    // reach nothing" -- a fake total revocation across the whole tailnet at
+    // once, which is exactly when the tool most needs to be trusted.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }, { loginName: "bob@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE || principal === "bob@example.com"
+          ? { body: preview([{ ports: ["tag:prod:22"], lineNumber: 1 }], principal) }
+          : { body: { type: "user", previewFor: principal } },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.deepEqual(res.data?.changed, []);
+    assert.equal(res.data?.failed.length, 1);
+    assert.match(res.data?.failed[0].error ?? "", /no .matches. array/);
+  });
+
+  it("caps the principals checked and reports the truncation with counts", async () => {
+    const users = Array.from({ length: 30 }, (_, i) => ({ loginName: `u${i}@example.com` }));
+    let previewCalls = 0;
+    installFetch({
+      users,
+      onPreview: (_policy, principal) => {
+        previewCalls++;
+        return { body: preview([{ ports: ["tag:prod:22"], lineNumber: 1 }], principal) };
+      },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(res.data?.principalsCompared, 25, "default cap");
+    assert.equal(res.data?.principalsAvailable, 30);
+    assert.equal(res.data?.truncated, true);
+    assert.equal(previewCalls, 50, "two preview calls per principal checked");
+    assert.match(res.data?.summary ?? "", /5 not checked \(cap 25\)/);
+  });
+
+  it("honors an explicit maxPrincipals and an explicit principals list", async () => {
+    let usersListed = false;
+    globalThis.fetch = async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/acl/preview")) {
+        const principal = new URL(url).searchParams.get("previewFor") ?? "";
+        return mockFetchResponse(200, preview([{ ports: ["tag:prod:22"], lineNumber: 1 }], principal));
+      }
+      if (url.includes("/users")) {
+        usersListed = true;
+        return mockFetchResponse(200, { users: [] });
+      }
+      return mockFetchResponse(200, BASELINE);
+    };
+
+    const res = await runDiff({
+      policy: '{"acls":[]}',
+      principals: ["a@example.com", "b@example.com", "c@example.com"],
+      maxPrincipals: 2,
+    });
+    assert.equal(usersListed, false, "an explicit principals list must not trigger a users lookup");
+    assert.equal(res.data?.principalsCompared, 2);
+    assert.equal(res.data?.truncated, true);
+  });
+
+  it("fails loudly when no user emails can be resolved", async () => {
+    // The alternative is a diff over zero principals, which serializes as a
+    // clean result and would be read as "this change affects nobody".
+    installFetch({
+      users: [{ id: "u1" }, { id: "u2" }],
+      onPreview: (_p, principal) => ({ body: preview([], principal) }),
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /Pass .principals. explicitly/);
+  });
+
+  it("fails when the current ACL cannot be read, rather than diffing against nothing", async () => {
+    installFetch({
+      aclStatus: 403,
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (_p, principal) => ({ body: preview([], principal) }),
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /could not read the current ACL/);
+  });
+
+  it("is annotated read-only and states its blind spot in the payload", async () => {
+    const { aclTools } = await import("./tools/acl.js");
+    const tool = findTool(aclTools, "tailscale_diff_acl_access");
+    assert.equal(tool.annotations.readOnlyHint, true);
+    assert.equal(tool.annotations.destructiveHint, false);
+    // The tag/group blind spot must reach whoever reads the OUTPUT, who may
+    // never have read the tool description.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (_p, principal) => ({ body: preview([{ ports: ["a:1"], lineNumber: 1 }], principal) }),
+    });
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.match(res.data?.scope ?? "", /tags or groups/);
+  });
+});
+
+/**
+ * Second wave, all from an adversarial review of the first.
+ *
+ * The original fourteen guarded the inverse case thoroughly -- three separate
+ * tests prove a FAILURE is never reported as lost access -- while nothing
+ * proved a genuine total revocation IS reported. A regression that routed real
+ * empty-match responses into `failed` would have kept all fourteen green while
+ * silencing the exact finding the tool exists to produce.
+ */
+describe("tailscale_diff_acl_access -- regressions found by review", () => {
+  const originalFetch = globalThis.fetch;
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    process.env.TAILSCALE_API_KEY = "tskey-api-test";
+    process.env.TAILSCALE_TAILNET = "test.ts.net";
+    delete process.env.TAILSCALE_OAUTH_CLIENT_ID;
+    delete process.env.TAILSCALE_OAUTH_CLIENT_SECRET;
+    globalThis.fetch = async () => mockFetchResponse(599, "no test installed a fetch stub");
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
+  });
+
+  const BASELINE = '{"acls":[{"action":"accept","src":["alice@example.com"],"dst":["tag:prod:22"]}]}';
+
+  function preview(matches: Array<Record<string, unknown>>, previewFor: string) {
+    return { matches, type: "user", previewFor };
+  }
+
+  /** As the first block's helper, plus it records every preview URL requested. */
+  function installFetch(opts: {
+    users?: Array<Record<string, unknown>>;
+    usersStatus?: number;
+    aclStatus?: number;
+    onPreview: (policy: string, principal: string) => { status?: number; body: unknown };
+    previewUrls?: string[];
+  }) {
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/acl/preview")) {
+        opts.previewUrls?.push(url);
+        const principal = new URL(url).searchParams.get("previewFor") ?? "";
+        const result = opts.onPreview((init?.body as string) ?? "", principal);
+        return mockFetchResponse(result.status ?? 200, result.body);
+      }
+      if (url.includes("/users")) {
+        return mockFetchResponse(opts.usersStatus ?? 200, { users: opts.users ?? [] });
+      }
+      if (url.includes("/acl")) {
+        return mockFetchResponse(opts.aclStatus ?? 200, BASELINE);
+      }
+      return mockFetchResponse(599, "unexpected URL in test");
+    };
+  }
+
+  async function runDiff(input: Record<string, unknown>) {
+    const { aclTools } = await import("./tools/acl.js");
+    return (await findTool(aclTools, "tailscale_diff_acl_access").handler(input)) as {
+      ok: boolean;
+      error?: string;
+      data?: {
+        summary: string;
+        principalsCompared: number;
+        principalsFailed: number;
+        principalsAvailable: number;
+        truncated: boolean;
+        scope: string;
+        changed: Array<{ principal: string; lost: string[]; gained: string[] }>;
+        unchanged: string[];
+        failed: Array<{ principal: string; error: string }>;
+      };
+    };
+  }
+
+  it("reports a genuine total revocation, the headline case the tool exists for", async () => {
+    // The real API returns {matches: []} for a principal a policy grants
+    // nothing to. That is a legitimate empty rule set, NOT a failure -- the
+    // three "failure is not revocation" tests must not have made this
+    // indistinguishable from an error.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE
+          ? { body: preview([{ ports: ["tag:prod:22", "tag:db:5432"], lineNumber: 1 }], principal) }
+          : { body: preview([], principal) },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.data?.changed, [
+      { principal: "alice@example.com", lost: ["tag:db:5432", "tag:prod:22"], gained: [] },
+    ]);
+    assert.deepEqual(res.data?.failed, [], "an empty match set is a real answer, not a failure");
+    assert.match(res.data?.summary ?? "", /^1 of 1 users compared lose access/);
+  });
+
+  it("puts a posture requirement in the diff key", async () => {
+    // The original "via and posture" test only ever varied `via`, so the
+    // posture half of the key was dead in the suite: deleting it kept every
+    // test green.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE
+          ? { body: preview([{ ports: ["tag:prod:22"], lineNumber: 1 }], principal) }
+          : { body: preview([{ ports: ["tag:prod:22"], postures: ["posture:latestMac"], lineNumber: 1 }], principal) },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.deepEqual(res.data?.changed, [
+      {
+        principal: "alice@example.com",
+        lost: ["tag:prod:22"],
+        gained: ["tag:prod:22 posture posture:latestMac"],
+      },
+    ]);
+  });
+
+  it("treats a reordered via list as unchanged, pinning the sort", async () => {
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE
+          ? { body: preview([{ ports: ["p:1"], via: ["tag:a", "tag:b"], lineNumber: 1 }], principal) }
+          : { body: preview([{ ports: ["p:1"], via: ["tag:b", "tag:a"], lineNumber: 1 }], principal) },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.deepEqual(res.data?.changed, [], "via ordering is not semantic; the sort() must absorb it");
+  });
+
+  it("excludes failed principals from the compared count and leads the summary with them", async () => {
+    // Previously the denominator was the ATTEMPTED count, so a run with
+    // failures still opened "0 of 25 users checked lose access" -- asserting
+    // coverage of users never compared, and contradicting the tool's own
+    // description, which promised failures were excluded from the counts.
+    installFetch({
+      users: [{ loginName: "a@example.com" }, { loginName: "b@example.com" }, { loginName: "c@example.com" }],
+      onPreview: (policy, principal) => {
+        if (principal === "a@example.com" && policy !== BASELINE) {
+          return { status: 500, body: { message: "boom" } };
+        }
+        return { body: preview([{ ports: ["p:1"], lineNumber: 1 }], principal) };
+      },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(res.data?.principalsCompared, 2, "the failed principal is not a compared one");
+    assert.equal(res.data?.principalsFailed, 1);
+    assert.match(res.data?.summary ?? "", /^1 of 3 users could not be checked/);
+    assert.match(res.data?.summary ?? "", /0 of 2 users compared lose access/);
+  });
+
+  it("fails rather than returning a clean diff when nothing could be compared", async () => {
+    // The single most reassuring-looking wrong answer: ok:true with changed:[]
+    // over a run that compared nobody. Every other zero-information outcome
+    // here is already a hard error.
+    installFetch({
+      users: [{ loginName: "a@example.com" }, { loginName: "b@example.com" }],
+      onPreview: (policy) => (policy === BASELINE ? { status: 500, body: { message: "down" } } : { body: {} }),
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /no users could be compared/);
+    assert.match(res.error ?? "", /all 2 preview attempts failed/);
+  });
+
+  it("abandons the run on a 401 instead of firing every remaining preview", async () => {
+    // A revoked credential is not principal-specific. Continuing spends 2N
+    // doomed requests and stacks one full multi-line auth diagnostic per
+    // principal into the payload.
+    const previewUrls: string[] = [];
+    installFetch({
+      users: Array.from({ length: 25 }, (_, i) => ({ loginName: `u${i}@example.com` })),
+      previewUrls,
+      onPreview: () => ({ status: 401, body: { message: "token revoked" } }),
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /authentication failed/);
+    assert.ok(
+      previewUrls.length <= 2,
+      `must stop at the first principal, fired ${previewUrls.length} preview requests`,
+    );
+  });
+
+  it("previews with type=user against the configured tailnet", async () => {
+    // Nothing asserted the request itself: flipping type to "ipport" would fail
+    // against the real API for every principal (an email is not an IP:port)
+    // while the whole suite stayed green, because the stub only read previewFor.
+    const previewUrls: string[] = [];
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      previewUrls,
+      onPreview: (_p, principal) => ({ body: preview([{ ports: ["p:1"], lineNumber: 1 }], principal) }),
+    });
+
+    await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(previewUrls.length, 2);
+    for (const url of previewUrls) {
+      assert.match(url, /\/tailnet\/test\.ts\.net\/acl\/preview\?/);
+      assert.match(url, /type=user/);
+      assert.match(url, /previewFor=alice%40example\.com/);
+    }
+  });
+
+  it("names the CURRENT policy when the baseline preview is the half that failed", async () => {
+    // acl.ts's "current" branch was never exercised: every failure fixture
+    // failed the proposed side.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (policy, principal) =>
+        policy === BASELINE
+          ? { status: 503, body: { message: "unavailable" } }
+          : { body: preview([{ ports: ["p:1"], lineNumber: 1 }], principal) },
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(res.ok, false, "one principal, and it failed -- nothing was compared");
+    assert.match(res.error ?? "", /current policy failed/);
+  });
+
+  it("surfaces a users-listing failure instead of diffing nobody", async () => {
+    installFetch({
+      usersStatus: 500,
+      onPreview: (_p, principal) => ({ body: preview([], principal) }),
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /could not list users to diff/);
+  });
+
+  it("discloses the posture-definition and port-range blind spots in the payload", async () => {
+    // Both are ways the diff comes back empty or misleading while real access
+    // changed, and both were found by review rather than by design. Keying on
+    // posture NAMES means redefining `posture:corp` more strictly leaves every
+    // key identical; the response-level posture definitions map is not read.
+    installFetch({
+      users: [{ loginName: "alice@example.com" }],
+      onPreview: (_p, principal) => ({ body: preview([{ ports: ["p:1"], lineNumber: 1 }], principal) }),
+    });
+
+    const res = await runDiff({ policy: '{"acls":[]}' });
+    assert.match(res.data?.scope ?? "", /posture DEFINITION/);
+    assert.match(res.data?.scope ?? "", /port list is narrowed/);
+    assert.match(res.data?.scope ?? "", /tags or groups/);
+  });
+});

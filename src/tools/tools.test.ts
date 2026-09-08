@@ -41,7 +41,7 @@ const allTools = [
 const EXPECTED_MODULE_COUNTS: Array<[string, ReadonlyArray<unknown>, number]> = [
   ["statusTools", statusTools, 1],
   ["deviceTools", deviceTools, 17],
-  ["aclTools", aclTools, 4],
+  ["aclTools", aclTools, 5],
   ["dnsTools", dnsTools, 11],
   ["keyTools", keyTools, 9],
   ["userTools", userTools, 7],
@@ -92,6 +92,7 @@ const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "tailscale_get_acl",
   "tailscale_validate_acl",
   "tailscale_preview_acl",
+  "tailscale_diff_acl_access",
   // dns
   "tailscale_get_nameservers",
   "tailscale_get_search_paths",
