@@ -27,6 +27,24 @@ export function isLocalCliEnabled(env: NodeJS.ProcessEnv): boolean {
   return env.TAILSCALE_LOCAL_CLI === "1" || env.TAILSCALE_LOCAL_CLI === "true";
 }
 
+/**
+ * Pure predicate: is forced client-side approval enabled for the given env?
+ *
+ * Case-sensitive "1" | "true", matching TAILSCALE_LOCAL_CLI above and
+ * TAILSCALE_READONLY in filter.ts -- an operator who sets several of these
+ * follows one rule, not three.
+ *
+ * OPT-IN, and deliberately so. `anthropic/requiresUserInteraction` is enforced
+ * client-side and cannot be routed around: it prompts even when an allow-rule
+ * matches, and in a never-prompt mode the client DENIES the call rather than
+ * running it. Defaulting this on would therefore break every unattended agent
+ * that upgrades -- a silent behaviour change on the exact tools whose failure
+ * is most disruptive. Operators opt in when a human is at the keyboard.
+ */
+export function isRequireApprovalEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env.TAILSCALE_REQUIRE_APPROVAL === "1" || env.TAILSCALE_REQUIRE_APPROVAL === "true";
+}
+
 // Handler signature uses method shorthand (not arrow syntax) to get bivariant
 // parameter checking. Without that, each tool file's narrowly-typed handler
 // (e.g. `(input: {deviceId: string}) => ...`) can't be assigned to a wider
@@ -35,10 +53,133 @@ export function isLocalCliEnabled(env: NodeJS.ProcessEnv): boolean {
 export type Tool = {
   name: string;
   description: string;
-  annotations: { readOnlyHint?: boolean };
+  // Widened from `{ readOnlyHint?: boolean }` when registration moved to
+  // registerTool: every tool file already sets all five of these, but the
+  // narrow type meant `annotations.title` was invisible at the registration
+  // site, so the display name could never be hoisted to the top-level `title`
+  // field the MCP spec defines. All optional, so no tool file changes.
+  annotations: {
+    title?: string;
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+  };
   inputSchema: ZodObject<ZodRawShape>;
   handler(input: unknown): Promise<unknown>;
 };
+
+/**
+ * Tools that must never be auto-approved, surfaced to the client as
+ * `_meta["anthropic/requiresUserInteraction"]`.
+ *
+ * THE CRITERION, applied literally: this server cannot undo the call using
+ * information the caller still holds. That is narrower than
+ * `destructiveHint: true` (23 tools) on purpose -- a hint that fires on a third
+ * of the surface trains operators to click through it, which is how a real
+ * confirmation gets ignored.
+ *
+ * Worked through the destructive set, the exclusions are the interesting half:
+ * - `suspend_user` has `restore_user`, so it is reversible in-server. It was on
+ *   the original shortlist for this list and is deliberately off it -- applying
+ *   the stated criterion honestly matters more than the intuition that
+ *   suspension feels severe.
+ * - `deauthorize_device` / `set_devices_authorized` have `authorize_device`.
+ * - `delete_device_posture_attribute` has `set_device_posture_attribute`.
+ * - The replace-all writes (`update_acl` aside) -- `set_device_routes`,
+ *   `set_device_tags`, the four DNS setters -- each have a `get_*` counterpart,
+ *   so a caller that read before writing can put the old value back. They are
+ *   still destructive, and withholding them belongs to a graduated write-policy
+ *   gate, not to this list.
+ *   (Deliberately not naming that env var here: release-metadata.test.ts
+ *   derives the sandbox allow-list by regexing src/ for TAILSCALE_* tokens and
+ *   cannot tell a comment from a read, so naming an unimplemented variable
+ *   would demand a grant for something nothing reads.)
+ * - The invite deletes revoke a pending invite that can be re-issued from the
+ *   same inputs.
+ *
+ * `update_acl` is the exception among replace-all writes and the reason this
+ * list exists: it can lock every device out of the tailnet in one call, and the
+ * previous HuJSON -- comments included -- is gone unless the caller happened to
+ * capture it first.
+ *
+ * The three `delete_*` entries carrying secrets (`delete_key`,
+ * `delete_oauth_app`, `delete_webhook`, `delete_log_stream_config`,
+ * `delete_posture_integration`) are irreversible in a second sense: the API
+ * never returns the credential again, so even a caller who re-creates the
+ * object cannot restore the value consumers were using.
+ *
+ * Alphabetised so an omission is easy to spot, and pinned by a name-literal
+ * test rather than derived from annotations -- deriving it would make the test
+ * agree with whatever the annotations happen to say, which is the bug the test
+ * exists to catch.
+ */
+export const FORCED_APPROVAL_TOOLS: readonly string[] = [
+  "tailscale_delete_device",
+  "tailscale_delete_key",
+  "tailscale_delete_log_stream_config",
+  "tailscale_delete_oauth_app",
+  "tailscale_delete_posture_integration",
+  "tailscale_delete_tailnet",
+  "tailscale_delete_user",
+  "tailscale_delete_webhook",
+  "tailscale_update_acl",
+];
+
+/**
+ * The client-side ceiling for `anthropic/maxResultSizeChars`. Values above it
+ * are ignored, so this is the cap and not a preference.
+ */
+export const MAX_RESULT_SIZE_CHARS = 500_000;
+
+/**
+ * Tools whose response size scales with the tailnet rather than with the
+ * request, declared so a large-but-legitimate result stays inline instead of
+ * being truncated to a file reference the agent has to read back mid-task.
+ *
+ * Every entry gets the ceiling rather than a hand-tuned number. A per-tool
+ * value would need to come from measuring real responses against a live tailnet
+ * (`RUN_INTEGRATION_TESTS=1`), and an invented one is fake precision: the honest
+ * claim here is only "this tool's output is bounded by tailnet size, not by the
+ * request, so do not truncate it". Tuning below the ceiling is a follow-up that
+ * needs measurement, not a guess.
+ *
+ * Deliberately NOT every read tool. The annotation exists to raise a limit that
+ * a specific tool legitimately exceeds; spraying it across all 46 read tools
+ * would say nothing and cost bytes in every `tools/list`.
+ */
+export const LARGE_RESULT_TOOLS: readonly string[] = [
+  "tailscale_get_acl",
+  "tailscale_get_audit_log",
+  "tailscale_get_network_flow_logs",
+  "tailscale_list_devices",
+  "tailscale_list_users",
+];
+
+/**
+ * Compose the `_meta` object a tool is registered with, or undefined when it
+ * carries none. Centralised here rather than spelled out per tool file so the
+ * whole policy is one readable list and one test, and so the env gate is
+ * applied in exactly one place.
+ *
+ * Returns a fresh object per call: `_meta` reaches the SDK's registry by
+ * reference and is echoed into every `tools/list`, so a shared literal would
+ * let one mutation leak across tools.
+ */
+export function buildToolMeta(
+  toolName: string,
+  options: { requireApproval: boolean },
+): Record<string, unknown> | undefined {
+  const meta: Record<string, unknown> = {};
+  if (options.requireApproval && FORCED_APPROVAL_TOOLS.includes(toolName)) {
+    // Must be the JSON boolean true; the client ignores any other value.
+    meta["anthropic/requiresUserInteraction"] = true;
+  }
+  if (LARGE_RESULT_TOOLS.includes(toolName)) {
+    meta["anthropic/maxResultSizeChars"] = MAX_RESULT_SIZE_CHARS;
+  }
+  return Object.keys(meta).length > 0 ? meta : undefined;
+}
 
 /**
  * Build the group -> tools registry the server registers and `filterTools`
