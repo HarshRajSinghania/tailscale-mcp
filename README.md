@@ -167,6 +167,74 @@ The "(overridden)" marker only fires for substantive profiles (`minimal` / `core
 
 If you don't set any filter, startup prints a tip pointing you at the profiles.
 
+## Scoping writes to areas
+
+`TAILSCALE_WRITE_GROUPS` names the areas an agent may **write** to. Everything else stays readable:
+
+```json
+{
+  "env": {
+    "TAILSCALE_WRITE_GROUPS": "devices,keys"
+  }
+}
+```
+
+That serves all 47 read tools plus the 18 writes in `devices` and `keys`, and withholds the other 38 writes — the ACL, DNS, users, webhooks, posture, services, invites, org-tailnets and log-streaming writes are simply not registered. Unset means no write gate, which is the shipped default.
+
+> **Read this first: this filters the tool list, not your API token.** The server still holds one credential with full tailnet authority in every configuration. An agent that also has a shell can `curl api.tailscale.com` with that same token and do everything this knob withheld. Scope the Tailscale OAuth client itself to the areas you actually need — that bound survives outside this process; this one does not. `TAILSCALE_WRITE_GROUPS` is the low-friction complement to credential scoping, not a replacement for it.
+
+### What a grant actually contains
+
+Group names are the same ones `TAILSCALE_TOOLS` uses. Writes per group:
+
+| Group | Writes | Group | Writes |
+|---|---|---|---|
+| `devices` | 13 | `webhooks` | 5 |
+| `invites` | 7 | `posture` | 3 |
+| `dns` | 6 | `services` | 3 |
+| `keys` | 5 | `tailnet` | 3 |
+| `users` | 5 | `log-streaming` | 3 |
+| `org-tailnets` | 2 | `acl` | 1 |
+
+`status`, `audit` and the opt-in `local-cli` group contain no writes at all, so granting them does nothing.
+
+**`devices` is the widest grant, and the one most likely to be set.** In a compose file `write=devices` reads like "device admin", but it hands over `delete_device`, `set_devices_authorized`, `expire_device`, `deauthorize_device`, `set_device_routes`, `set_device_tags` and `update_device_key` alongside `rename_device`. There is no finer setting: an honest "safe subset" of `devices` is `rename_device` alone, and a knob whose useful value is one tool is not a knob.
+
+### Three grants are tailnet-admin-equivalent
+
+`keys`, `users` and `acl` are not blocked — CI key rotation legitimately needs `keys` — but grant them knowing:
+
+- **`keys`** — `tailscale_create_key` mints an OAuth client with whatever scopes the caller asks for, including `acl`. That credential outlives the agent's session and is not subject to this or any other setting here.
+- **`users`** — `tailscale_update_user_role` accepts `owner`.
+- **`acl`** — `tailscale_update_acl` rewrites policy for every principal in the tailnet.
+
+The server prints this on startup when your grant includes one of them.
+
+### What it does and does not bound
+
+It bounds **where** an agent may write. It does not bound **severity within** a granted area: inside a granted group, writes run unattended, including the grant-direction ones. Pair it with `TAILSCALE_REQUIRE_APPROVAL=1` when a human is at the keyboard — but understand that for an unattended agent that pairing contributes nothing, because a never-prompt client *denies* those calls rather than prompting.
+
+### Precedence, and what happens when you get it wrong
+
+| Situation | Result |
+|---|---|
+| Unset, empty, whitespace, or commas-only | No write gate. `-e VAR` with no value must not silently revoke every write. |
+| `TAILSCALE_READONLY=1` also set | Readonly wins; banner says `readonly (TAILSCALE_WRITE_GROUPS ignored)`. |
+| A name is misspelled (`devises`) | **Grants nothing** and names the typo. Unlike `TAILSCALE_TOOLS`, there is no fallback — a typo'd write grant that fell back would hand over all 56 writes at the moment you were restricting them. |
+| Partly misspelled (`devices,dnss`) | Grants the valid half, warns about the rest. |
+| A granted group is not loaded by `TAILSCALE_TOOLS` / `TAILSCALE_PROFILE` | The grant has no effect; a separate warning says so, since the name is not a typo. |
+| `none`, `all`, `off`, `*` | Not reserved words — they are unknown group names, so they grant nothing. Use `TAILSCALE_READONLY=1` for no writes, or leave this unset for all writes. The server points you at the right spelling. |
+
+Names are case-sensitive, matching `TAILSCALE_TOOLS`.
+
+**The upgrade contract:** upgrading this package can never widen the set of *areas* an agent may write to. A new group is in nobody's grant until a human types its name. It can, however, add tools inside an area you already granted — a pinned test makes that a reviewed line in the diff rather than a silent change.
+
+The startup banner shows what applied:
+
+```
+@yawlabs/tailscale-mcp v0.19.0 ready (59 tools, write=devices,keys)
+```
+
 ## Requiring approval on irreversible tools
 
 `readOnlyHint` / `destructiveHint` are *advisory* — the MCP spec says clients MUST treat annotations as untrusted, and most don't gate on them. `TAILSCALE_REQUIRE_APPROVAL=1` adds a stronger signal that supported clients enforce:

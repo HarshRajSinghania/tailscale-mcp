@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { filterTools, PROFILES, parseReadonlyFlag } from "./filter.js";
+import { filterTools, PROFILES, parseGroupList, parseReadonlyFlag } from "./filter.js";
 
 type TestTool = { name: string; annotations: { readOnlyHint: boolean } };
 const groups: Record<string, ReadonlyArray<TestTool>> = {
@@ -382,5 +382,136 @@ describe("parseReadonlyFlag", () => {
   it("returns false for unrelated truthy-looking values", () => {
     assert.equal(parseReadonlyFlag("on"), false);
     assert.equal(parseReadonlyFlag("enabled"), false);
+  });
+});
+
+describe("TAILSCALE_WRITE_GROUPS", () => {
+  const writeNames = (opts: Parameters<typeof filterTools>[1]) =>
+    filterTools(groups, opts)
+      .tools.filter((t) => t.annotations.readOnlyHint !== true)
+      .map((t) => t.name)
+      .sort();
+
+  it("serves every write when the knob is unset, byte-identical to today", () => {
+    assert.deepEqual(writeNames({ writeGroups: undefined }), ["delete_device", "update_acl"]);
+  });
+
+  it("serves writes only in the granted group, and reads everywhere", () => {
+    const { tools, writeGroups } = filterTools(groups, { writeGroups: "devices" });
+    assert.deepEqual(
+      tools.map((t) => t.name).sort(),
+      ["delete_device", "get_acl", "get_dns", "list_devices"],
+      "an ungranted group keeps its READ tools -- this bounds writing, not loading",
+    );
+    assert.deepEqual(writeGroups, ["devices"]);
+  });
+
+  it("grants nothing on an all-unknown value, deliberately NOT falling back like TAILSCALE_TOOLS", () => {
+    // The asymmetry is the point. A typo'd LOAD filter falls back to loading more,
+    // whose worst case is a chatty server. A typo'd WRITE grant that fell back the
+    // same way would hand over every write at the exact moment its operator was
+    // restricting it -- fail-open, on the input a careless operator most likely types.
+    const { tools, writeGroups, unknownWriteGroups } = filterTools(groups, { writeGroups: "devises" });
+    assert.deepEqual(writeNames({ writeGroups: "devises" }), [], "a typo must grant nothing");
+    assert.deepEqual(writeGroups, [], "configured-but-empty, distinct from unset");
+    assert.deepEqual(unknownWriteGroups, ["devises"]);
+    assert.ok(
+      tools.length > 0,
+      "the degraded state is a working read-only server, not an outage -- the agent can still explain the problem",
+    );
+  });
+
+  it("grants the valid half of a partial typo and names the bad one", () => {
+    assert.deepEqual(writeNames({ writeGroups: "devices,dnss" }), ["delete_device"]);
+    assert.deepEqual(filterTools(groups, { writeGroups: "devices,dnss" }).unknownWriteGroups, ["dnss"]);
+  });
+
+  it("treats a sentinel-looking value as an unknown name, so a guess fails closed", () => {
+    // The grammar reserves nothing: a reserved word could collide with a future group
+    // name, which is the hazard the org-tailnets naming comment documents. `none`
+    // lands on deny-all (what the operator meant) and `all` lands on deny-all too
+    // (the safe direction for a wrong guess) -- index.ts adds a pointer for both.
+    for (const value of ["none", "all", "off", "*"]) {
+      assert.deepEqual(writeNames({ writeGroups: value }), [], `${value} must not grant writes`);
+    }
+  });
+
+  it("treats whitespace-only and commas-only as unset rather than deny-all", () => {
+    // `-e TAILSCALE_WRITE_GROUPS` in docker, or an unexpanded ${VAR}, produces exactly
+    // this shape. Reading it as "revoke every write" would turn a config typo into a
+    // silent outage on upgrade.
+    for (const value of ["   ", ",,,", ""]) {
+      assert.deepEqual(writeNames({ writeGroups: value }), ["delete_device", "update_acl"], JSON.stringify(value));
+      assert.equal(filterTools(groups, { writeGroups: value }).writeGroups, undefined, "must read as unset");
+    }
+  });
+
+  it("lets TAILSCALE_READONLY win over a grant, and says which knob did it", () => {
+    const r = filterTools(groups, { readonly: "1", writeGroups: "devices" });
+    assert.deepEqual(writeNames({ readonly: "1", writeGroups: "devices" }), []);
+    assert.deepEqual(r.writeGroups, []);
+    assert.equal(r.writeGroupsOverriddenByReadonly, true, "the banner must be able to name the cause");
+  });
+
+  it("does not blame readonly when the grant was empty anyway", () => {
+    // READONLY=1 plus an all-typo grant yields no writes either way; flagging the
+    // override would point the operator at the wrong knob.
+    const r = filterTools(groups, { readonly: "1", writeGroups: "devises" });
+    assert.equal(r.writeGroupsOverriddenByReadonly, undefined);
+  });
+
+  it("reports a grant the load filter never loaded, separately from a typo", () => {
+    const r = filterTools(groups, { tools: "acl", writeGroups: "devices" });
+    assert.deepEqual(r.writeGroupsNotLoaded, ["devices"]);
+    assert.equal(r.unknownWriteGroups, undefined, "spelled correctly -- not a typo, a different fix");
+    assert.deepEqual(r.writeGroups, [], "the grant had no effect");
+  });
+
+  it("intersects with the group filter rather than re-expanding it", () => {
+    const { tools } = filterTools(groups, { tools: "devices", writeGroups: "devices,acl" });
+    assert.deepEqual(tools.map((t) => t.name).sort(), ["delete_device", "list_devices"], "acl stays unloaded");
+  });
+
+  it("withholds a tool with a missing readOnlyHint unless its group is granted", () => {
+    // The fail-closed guard at the write predicate is shared with TAILSCALE_READONLY,
+    // so a tool that forgot its annotation is a write for BOTH knobs. Local fixture
+    // because the shared one types the hint as required.
+    const missingHint: Record<string, ReadonlyArray<{ name: string; annotations: { readOnlyHint?: boolean } }>> = {
+      devices: [{ name: "no_hint", annotations: {} }],
+      acl: [{ name: "also_no_hint", annotations: {} }],
+    };
+    assert.deepEqual(
+      filterTools(missingHint, { writeGroups: "devices" }).tools.map((t) => t.name),
+      ["no_hint"],
+      "un-annotated tools are writes: served only where the group was granted",
+    );
+    assert.deepEqual(
+      filterTools(missingHint, { writeGroups: "acl" }).tools.map((t) => t.name),
+      ["also_no_hint"],
+    );
+  });
+
+  it("is a silent no-op when the granted group holds no write tools", () => {
+    const r = filterTools(groups, { writeGroups: "dns" });
+    assert.deepEqual(writeNames({ writeGroups: "dns" }), [], "dns has no writes in the fixture");
+    assert.deepEqual(r.writeGroups, ["dns"], "the grant is legal and applied; it just contains nothing");
+    assert.equal(r.unknownWriteGroups, undefined);
+  });
+
+  it("is case-sensitive, matching TAILSCALE_TOOLS rather than diverging from it", () => {
+    // Both knobs name the same groups. Folding case in one and not the other would
+    // make `Devices` mean different things in two adjacent variables.
+    assert.deepEqual(writeNames({ writeGroups: "Devices" }), []);
+    assert.deepEqual(filterTools(groups, { writeGroups: "Devices" }).unknownWriteGroups, ["Devices"]);
+  });
+});
+
+describe("parseGroupList", () => {
+  it("is the one parse rule both group knobs share", () => {
+    assert.deepEqual(parseGroupList("devices, acl"), ["devices", "acl"]);
+    assert.deepEqual(parseGroupList(" devices , , acl "), ["devices", "acl"]);
+    for (const empty of [undefined, "", "   ", ",,,"]) {
+      assert.equal(parseGroupList(empty), null, JSON.stringify(empty));
+    }
   });
 });

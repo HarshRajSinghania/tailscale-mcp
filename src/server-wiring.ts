@@ -89,12 +89,14 @@ export type Tool = {
  * - The replace-all writes (`update_acl` aside) -- `set_device_routes`,
  *   `set_device_tags`, the four DNS setters -- each have a `get_*` counterpart,
  *   so a caller that read before writing can put the old value back. They are
- *   still destructive, and withholding them belongs to a graduated write-policy
- *   gate, not to this list.
- *   (Deliberately not naming that env var here: release-metadata.test.ts
- *   derives the sandbox allow-list by regexing src/ for TAILSCALE_* tokens and
- *   cannot tell a comment from a read, so naming an unimplemented variable
- *   would demand a grant for something nothing reads.)
+ *   still destructive, and withholding them belongs to a graduated write gate,
+ *   not to this list. That gate now exists: TAILSCALE_WRITE_GROUPS withholds
+ *   every write outside the granted areas. (An earlier revision of this comment
+ *   deliberately did not name it, because release-metadata.test.ts derives the
+ *   sandbox allow-list by regexing src/ for TAILSCALE_* tokens and cannot tell a
+ *   comment from a read -- naming it then would have demanded a launcher grant
+ *   for a variable nothing read. The grant ships in the same commit as this
+ *   sentence.)
  * - The invite deletes revoke a pending invite that can be re-issued from the
  *   same inputs.
  *
@@ -274,6 +276,13 @@ export interface BannerFilterInputs {
   profileEnv: string | undefined;
   readonlyMode: boolean;
   localCliEnabled: boolean;
+  // Optional rather than required-but-undefined: fourteen existing call sites in
+  // server-wiring.test.ts would otherwise need mechanical edits that assert nothing.
+  // The risk optionality creates -- index.ts forgetting to pass them -- is covered by
+  // an index-level test that drives a real startup and asserts the `write=` segment.
+  // Absent means the knob was never set; an empty array means "granted nothing".
+  writeGroups?: string[] | undefined;
+  writeGroupsOverriddenByReadonly?: boolean | undefined;
 }
 
 /**
@@ -301,7 +310,19 @@ export function formatBannerFilterSuffix(inputs: BannerFilterInputs): string {
   return [
     profileLabel,
     groupsLabel,
-    inputs.readonlyMode ? "readonly" : null,
+    inputs.readonlyMode
+      ? inputs.writeGroupsOverriddenByReadonly
+        ? "readonly (TAILSCALE_WRITE_GROUPS ignored)"
+        : "readonly"
+      : null,
+    // `write=none` (configured, granted nothing) is a different state from no segment
+    // at all (knob unset, every write served), and an operator debugging "why can it
+    // not write" needs to tell them apart at a glance.
+    inputs.writeGroups
+      ? inputs.writeGroups.length > 0
+        ? `write=${inputs.writeGroups.join(",")}`
+        : "write=none"
+      : null,
     inputs.localCliEnabled ? "local-cli=on" : null,
   ]
     .filter(Boolean)

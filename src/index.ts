@@ -107,10 +107,15 @@ if (!cliSubcommandHandled) {
     explicitTools,
     profileWouldFilter,
     toolsAllUnknown,
+    writeGroups,
+    unknownWriteGroups,
+    writeGroupsNotLoaded,
+    writeGroupsOverriddenByReadonly,
   } = filterTools(toolGroups, {
     tools: process.env.TAILSCALE_TOOLS,
     readonly: process.env.TAILSCALE_READONLY,
     profile: process.env.TAILSCALE_PROFILE,
+    writeGroups: process.env.TAILSCALE_WRITE_GROUPS,
   });
 
   if (unknownGroups.length > 0) {
@@ -123,6 +128,35 @@ if (!cliSubcommandHandled) {
       : "";
     console.error(
       `@yawlabs/tailscale-mcp: TAILSCALE_TOOLS includes unknown group(s): ${unknownGroups.join(", ")}. Valid groups: ${validNames.join(", ")}.${fallbackNote}`,
+    );
+  }
+
+  if (unknownWriteGroups && unknownWriteGroups.length > 0) {
+    const validNames = Object.keys(toolGroups);
+    // No fallback here, unlike TAILSCALE_TOOLS: an unrecognised name grants nothing.
+    // Say so explicitly, because the safe outcome and a broken config look identical
+    // from the agent's side -- it just sees fewer tools.
+    const sentinels = new Set(["none", "off", "false", "0", "all", "*"]);
+    const guessed = unknownWriteGroups.filter((g) => sentinels.has(g.toLowerCase()));
+    // Nothing is reserved in the grammar (a reserved word could collide with a future
+    // group name), so a plausible-looking sentinel lands here as an unknown name. Point
+    // at the spelling that does what they meant rather than adding grammar for it.
+    const hint = guessed.some((g) => ["all", "*"].includes(g.toLowerCase()))
+      ? ' Note: "all" is not a group name -- leave TAILSCALE_WRITE_GROUPS unset to allow writes in every loaded group.'
+      : guessed.length > 0
+        ? " Note: to disable writes entirely, TAILSCALE_READONLY=1 is the shipped spelling."
+        : "";
+    console.error(
+      `@yawlabs/tailscale-mcp: TAILSCALE_WRITE_GROUPS includes unknown group(s): ${unknownWriteGroups.join(", ")}. Valid groups: ${validNames.join(", ")}. Those names granted no write access; tools outside the granted groups are served read-only.${hint}`,
+    );
+  }
+
+  // A separate warning from the typo case on purpose: these names are spelled
+  // correctly, so telling the operator to check their spelling would send them
+  // looking for a mistake that is not there. The fix is the load filter, not this one.
+  if (writeGroupsNotLoaded && writeGroupsNotLoaded.length > 0) {
+    console.error(
+      `@yawlabs/tailscale-mcp: TAILSCALE_WRITE_GROUPS names group(s) that your TAILSCALE_TOOLS / TAILSCALE_PROFILE filter does not load: ${writeGroupsNotLoaded.join(", ")}. Those grants had no effect.`,
     );
   }
 
@@ -248,7 +282,27 @@ if (!cliSubcommandHandled) {
     profileEnv: process.env.TAILSCALE_PROFILE,
     readonlyMode,
     localCliEnabled,
+    writeGroups,
+    writeGroupsOverriddenByReadonly,
   });
+
+  // Not folded into the one-line banner: formatBannerFilterSuffix stays a small pure
+  // function, and this needs room to be specific. Fires only when the grant actually
+  // includes an admin-equivalent area, so it does not become background noise.
+  //
+  // The honest framing this exists to deliver: TAILSCALE_WRITE_GROUPS filters the TOOL
+  // LIST, not the credential. A grant to any of these three is tailnet-admin-equivalent
+  // regardless of what the other groups are set to.
+  const ADMIN_EQUIVALENT = ["keys", "users", "acl"];
+  const adminGrants = (writeGroups ?? []).filter((g) => ADMIN_EQUIVALENT.includes(g));
+  if (adminGrants.length > 0) {
+    console.error(
+      `@yawlabs/tailscale-mcp: note -- a write grant to ${adminGrants.join(", ")} is tailnet-admin-equivalent. ` +
+        "tailscale_create_key mints an OAuth client with any scopes the caller asks for, " +
+        'tailscale_update_user_role accepts "owner", and tailscale_update_acl rewrites policy for every principal. ' +
+        "Scope the Tailscale OAuth client itself to the same areas -- that bound survives outside this process; this one does not.",
+    );
+  }
   console.error(
     `@yawlabs/tailscale-mcp v${version} ready (${allTools.length} tools${filterSuffix ? `, ${filterSuffix}` : ""})`,
   );

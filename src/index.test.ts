@@ -559,3 +559,70 @@ describe("tool _meta over a live session", () => {
     assert.equal(listDevices?.title, "List devices", "title must come from the tool's own annotations");
   });
 });
+
+describe("TAILSCALE_WRITE_GROUPS wiring", () => {
+  // These spawn the BUNDLE. filter.ts can resolve the grant perfectly while index.ts
+  // forgets to pass writeGroups into formatBannerFilterSuffix -- the two banner fields
+  // are optional precisely so fourteen existing call sites did not need mechanical
+  // edits, and this is what pays for that choice.
+
+  it("reports the grant in the banner and withholds writes outside it", async () => {
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "devices,keys" });
+    assert.match(stderr, /write=devices,keys/);
+    assert.ok(
+      toolCount(stderr) < toolCount(await captureStartup({ ...API_KEY })),
+      "a grant must withhold the writes outside it",
+    );
+  });
+
+  it("grants nothing on a typo and names it, rather than falling back like TAILSCALE_TOOLS", async () => {
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "devises" });
+    assert.match(stderr, /TAILSCALE_WRITE_GROUPS includes unknown group\(s\): devises/);
+    assert.match(stderr, /write=none/);
+    // The load filter's all-unknown fallback must NOT have leaked into the write gate.
+    assert.equal(
+      toolCount(stderr),
+      toolCount(await captureStartup({ ...API_KEY, TAILSCALE_READONLY: "1" })),
+      "an all-unknown grant must serve exactly the read-only surface",
+    );
+  });
+
+  it("points a sentinel guess at the spelling that does what it meant", async () => {
+    const all = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "all" });
+    assert.match(all, /"all" is not a group name -- leave TAILSCALE_WRITE_GROUPS unset/);
+    const none = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "none" });
+    assert.match(none, /TAILSCALE_READONLY=1 is the shipped spelling/);
+  });
+
+  it("warns when a grant names a group the load filter never loaded", async () => {
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_TOOLS: "acl", TAILSCALE_WRITE_GROUPS: "dns" });
+    assert.match(stderr, /does not load: dns\. Those grants had no effect/);
+    // Distinct from the typo warning: the name is spelled correctly.
+    assert.ok(!/includes unknown group/.test(stderr), "a loaded-filter mismatch is not a typo");
+  });
+
+  it("names readonly as the cause when it overrides a grant", async () => {
+    const stderr = await captureStartup({
+      ...API_KEY,
+      TAILSCALE_READONLY: "1",
+      TAILSCALE_WRITE_GROUPS: "devices",
+    });
+    assert.match(stderr, /readonly \(TAILSCALE_WRITE_GROUPS ignored\)/);
+  });
+
+  it("warns that a keys, users or acl grant is admin-equivalent", async () => {
+    // The single most important line this feature prints: the knob filters the tool
+    // list, not the credential, and these three areas are tailnet-admin-equivalent.
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "keys" });
+    assert.match(stderr, /a write grant to keys is tailnet-admin-equivalent/);
+    assert.match(stderr, /Scope the Tailscale OAuth client itself/);
+    // Silent when the grant is not admin-equivalent, so it does not become noise.
+    const quiet = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "devices" });
+    assert.ok(!/admin-equivalent/.test(quiet), "must not fire on a non-admin grant");
+  });
+
+  it("changes nothing when unset", async () => {
+    const stderr = await captureStartup({ ...API_KEY });
+    assert.ok(!/write=/.test(stderr), "no gate configured means no write= segment");
+  });
+});
