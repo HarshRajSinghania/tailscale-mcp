@@ -278,6 +278,76 @@ async function conductMcpSession(extraEnv: Record<string, string>): Promise<McpS
   }
 }
 
+/**
+ * Conduct a session and call one tool, returning its decoded payload.
+ *
+ * Separate from conductMcpSession because that one is shaped around list results.
+ * Both hand-roll the framing for the same reason: the stdio transport is
+ * newline-delimited JSON with no Content-Length headers, and asserting against raw
+ * frames keeps these tests independent of the SDK client's own behaviour.
+ *
+ * The payload is double-decoded on purpose -- wrapToolHandler serialises the tool's
+ * `data` into a text content block, so what an agent actually reads is the JSON
+ * inside that string, not the JSON-RPC result bag around it.
+ */
+async function callMcpTool(
+  extraEnv: Record<string, string>,
+  toolName: string,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const NL = "\n";
+  const child = spawn(process.execPath, [serverEntry], {
+    env: { PATH: process.env.PATH ?? "", ...extraEnv },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  try {
+    return await new Promise<Record<string, unknown>>((resolvePromise, reject) => {
+      let buffered = "";
+      const deadline = setTimeout(() => reject(new Error(`no tools/call response within 15s for ${toolName}`)), 15_000);
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        buffered += chunk;
+        for (let nl = buffered.indexOf(NL); nl >= 0; nl = buffered.indexOf(NL)) {
+          const line = buffered.slice(0, nl).trim();
+          buffered = buffered.slice(nl + 1);
+          if (!line) continue;
+          const msg = JSON.parse(line) as JsonRpcResponse;
+          if (msg.id === 1) {
+            child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + NL);
+            child.stdin.write(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                method: "tools/call",
+                params: { name: toolName, arguments: args },
+              }) + NL,
+            );
+          }
+          if (msg.id === 2) {
+            clearTimeout(deadline);
+            const result = msg.result as { content?: Array<{ text?: string }>; isError?: boolean } | undefined;
+            assert.ok(!result?.isError, `${toolName} returned an error: ${result?.content?.[0]?.text}`);
+            const text = result?.content?.[0]?.text;
+            assert.equal(typeof text, "string", `${toolName} returned no text content`);
+            resolvePromise(JSON.parse(text as string) as Record<string, unknown>);
+          }
+        }
+      });
+      child.stdin.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } },
+        }) + NL,
+      );
+    });
+  } finally {
+    child.stdin.end();
+    child.kill();
+  }
+}
+
 const API_KEY = { TAILSCALE_API_KEY: "tskey-api-startup-test" };
 
 describe("server startup banner", () => {
@@ -481,10 +551,15 @@ describe("MCP protocol surface", () => {
     // can, and it also pins that the name argument stayed in first position of
     // index.ts's server.registerTool(name, config, handler) call, which nothing
     // else in the repo reads.
+    // The catalog tool is registered OUTSIDE buildToolGroups on purpose -- it is not a
+    // Tailscale API tool, and every count in the README and release-metadata.test.ts
+    // derives from that registry, so admitting it there would make "97 admin-API
+    // tools" false. It must therefore appear in tools/list and NOT in the registry,
+    // which is exactly what this asserts.
     assert.deepEqual(
       session.tools.map((t) => t.name).sort(),
-      registryToolNames({}),
-      "tools/list disagrees with the tool registry",
+      [...registryToolNames({}), "tailscale_tool_groups"].sort(),
+      "tools/list disagrees with the tool registry plus the always-on catalog",
     );
   });
 });
@@ -710,5 +785,68 @@ describe("TAILSCALE_WRITE_GROUPS wiring", () => {
     assert.match(stderr, /write=local-cli/);
     assert.ok(!/not enabled in this process/.test(stderr), "it IS enabled here");
     assert.ok(!/includes unknown group/.test(stderr), "and it is not a typo");
+  });
+});
+
+describe("the always-on catalog tool", () => {
+  // The exemption is the whole feature. A catalog that any filter can withhold is
+  // useless precisely when it is needed -- the more restricted the server, the more
+  // an agent needs to be told why.
+  it("survives every filter combination, including ones that withhold everything else", async () => {
+    const hostile: Array<[string, Record<string, string>]> = [
+      ["readonly", { TAILSCALE_READONLY: "1" }],
+      ["minimal profile", { TAILSCALE_PROFILE: "minimal" }],
+      ["single group", { TAILSCALE_TOOLS: "audit" }],
+      ["all-unknown tools", { TAILSCALE_TOOLS: "nonsense" }],
+      ["no writes granted", { TAILSCALE_WRITE_GROUPS: "devises" }],
+      [
+        "everything at once",
+        {
+          TAILSCALE_PROFILE: "minimal",
+          TAILSCALE_TOOLS: "audit",
+          TAILSCALE_READONLY: "1",
+          TAILSCALE_WRITE_GROUPS: "devises",
+        },
+      ],
+    ];
+    for (const [label, env] of hostile) {
+      const session = await conductMcpSession({ ...API_KEY, ...env });
+      const names = session.tools.map((t) => t.name);
+      assert.ok(names.includes("tailscale_tool_groups"), `the catalog must survive: ${label}`);
+    }
+  });
+
+  it("is callable and explains a withheld tool over a real session", async () => {
+    // End to end through the protocol, against the spawned BUNDLE: the unit tests
+    // exercise the pure functions, and this is what proves the wiring in index.ts
+    // passes the right state rather than a plausible-looking empty one.
+    const res = await callMcpTool({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "dns" }, "tailscale_tool_groups", {
+      toolName: "tailscale_delete_device",
+    });
+    assert.equal(res.available, false);
+    assert.equal(res.group, "devices");
+    assert.match(String(res.toEnable), /add "devices" to TAILSCALE_WRITE_GROUPS/);
+  });
+
+  it("distinguishes a nonexistent tool from a withheld one, end to end", async () => {
+    const res = await callMcpTool({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "dns" }, "tailscale_tool_groups", {
+      toolName: "tailscale_reboot_device",
+    });
+    assert.equal(res.available, false);
+    assert.equal(res.group, undefined, "no group -- it exists nowhere");
+    assert.match(String(res.reason), /no tool by that name exists/);
+    assert.equal(res.toEnable, undefined, "no env change can produce it");
+  });
+
+  it("reports the real registry's groups with per-group remedies", async () => {
+    const res = await callMcpTool({ ...API_KEY, TAILSCALE_PROFILE: "minimal" }, "tailscale_tool_groups", {});
+    const groups = res.groups as Array<{ group: string; status: string; toEnable?: string }>;
+    const acl = groups.find((g) => g.group === "acl");
+    assert.equal(acl?.status, "unavailable");
+    assert.match(String(acl?.toEnable), /TAILSCALE_PROFILE=full/);
+    // local-cli is off for a different reason and must say so rather than blaming
+    // the profile the operator did set.
+    const localCli = groups.find((g) => g.group === "local-cli");
+    assert.equal(localCli?.toEnable, "set TAILSCALE_LOCAL_CLI=1");
   });
 });

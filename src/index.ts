@@ -18,6 +18,7 @@ import {
   tailnetStatusResource,
   wrapToolHandler,
 } from "./server-wiring.js";
+import { buildMetaTools } from "./tools/meta.js";
 
 // Injected at build time by esbuild. Falls back to reading package.json for
 // tsc / run-from-source builds. The fallback probes a few candidate depths
@@ -212,6 +213,46 @@ if (!cliSubcommandHandled) {
     version,
   });
 
+  const requireApproval = isRequireApprovalEnabled(process.env);
+  // The catalog tool, registered BEFORE the filtered set and outside it: no filter
+  // can reach it, because it never enters filterTools. Every other diagnostic this
+  // server prints about its own configuration goes to stderr, which the model never
+  // sees -- so without this, a withheld tool and a nonexistent one are the same
+  // observation to an agent, and the roadmap's "invents a workaround" failure follows.
+  //
+  // It is NOT in buildToolGroups on purpose: that registry is the Tailscale API
+  // surface, every count in the README and release-metadata.test.ts derives from it,
+  // and "97 admin-API tools" has to keep being true.
+  const metaTools = buildMetaTools({
+    // The FULL registry, with opt-ins forced on, so the catalog can report on a group
+    // that is currently disabled -- which is exactly the group an agent needs
+    // explained. Reporting only what loaded would make local-cli invisible rather
+    // than explained.
+    fullRegistry: buildToolGroups({ ...process.env, TAILSCALE_LOCAL_CLI: "1" }),
+    // Ground truth for availability: what this server actually serves. Deliberately
+    // not a re-derivation of the filter logic, so the catalog cannot disagree with
+    // the server about what exists.
+    registeredNames: new Set(allTools.map((t) => t.name)),
+    toolsEnv: process.env.TAILSCALE_TOOLS,
+    profileEnv: process.env.TAILSCALE_PROFILE,
+    writeGroupsEnv: process.env.TAILSCALE_WRITE_GROUPS,
+    readonlyMode: parseReadonlyFlag(process.env.TAILSCALE_READONLY),
+    localCliEnabled,
+  });
+  for (const tool of metaTools) {
+    server.registerTool(
+      tool.name,
+      {
+        title: tool.annotations.title,
+        description: tool.description,
+        inputSchema: tool.inputSchema.shape,
+        annotations: tool.annotations,
+        _meta: buildToolMeta(tool.name, { requireApproval }),
+      },
+      wrapToolHandler(tool),
+    );
+  }
+
   // Register all tools with annotations.
   //
   // registerTool, NOT the legacy server.tool(): all six tool() overloads are
@@ -223,7 +264,6 @@ if (!cliSubcommandHandled) {
   // own comment on tool(): "Support for this style is frozen as of protocol
   // version 2025-03-26. Future additions to tool definition should *NOT* be
   // added."
-  const requireApproval = isRequireApprovalEnabled(process.env);
   for (const tool of allTools) {
     server.registerTool(
       tool.name,

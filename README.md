@@ -5,7 +5,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/YawLabs/tailscale-mcp)](https://github.com/YawLabs/tailscale-mcp/stargazers)
 [![Release](https://img.shields.io/badge/release-local-blue)](./release.sh)
 
-**Ask your agent questions about your tailnet and have it act on the answers.** 97 admin-API tools + 6 optional local-CLI diagnostics + 4 resources spanning the [Tailscale v2 API](https://tailscale.com/api) — devices, ACLs, DNS, keys and trust credentials, users, invites, webhooks, log streaming, posture, services, and organization tailnets. Backed by 1100+ unit tests and an opt-in live-tailnet integration suite.
+**Ask your agent questions about your tailnet and have it act on the answers.** 97 admin-API tools + 6 optional local-CLI diagnostics + 1 always-on catalog tool + 4 resources spanning the [Tailscale v2 API](https://tailscale.com/api) — devices, ACLs, DNS, keys and trust credentials, users, invites, webhooks, log streaming, posture, services, and organization tailnets. Backed by 1100+ unit tests and an opt-in live-tailnet integration suite.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
@@ -166,6 +166,42 @@ When both `TAILSCALE_PROFILE` and `TAILSCALE_TOOLS` are set, `TAILSCALE_TOOLS` w
 The "(overridden)" marker only fires for substantive profiles (`minimal` / `core`); `profile=full` is a no-op preset, so it's shown without the marker when `TAILSCALE_TOOLS` is also set.
 
 If you don't set any filter, startup prints a tip pointing you at the profiles.
+
+### And how the *agent* knows
+
+Everything above is stderr -- your MCP client's log. The model never sees it, so a
+withheld tool and a tool that was never built look identical from the agent's side.
+That is how an agent ends up working around a restriction instead of reporting it.
+
+`tailscale_tool_groups` closes that gap. It is **always registered**, whatever the
+filters say, and answers the question in-band:
+
+```
+> "Why can't you delete that device?"
+
+  tailscale_tool_groups({ toolName: "tailscale_delete_device" })
+
+  {
+    "tool": "tailscale_delete_device",
+    "available": false,
+    "group": "devices",
+    "kind": "write",
+    "reason": "TAILSCALE_WRITE_GROUPS is set to \"dns\", which does not grant writes here",
+    "toEnable": "add \"devices\" to TAILSCALE_WRITE_GROUPS (e.g. \"dns,devices\")"
+  }
+```
+
+It separates the three cases an agent otherwise cannot tell apart:
+
+| Case | What the agent should do |
+|---|---|
+| No such tool exists, under any configuration | Find another approach -- no setting will produce it |
+| Exists, but its group is not loaded | Report `toEnable` to you; do not work around it |
+| Exists and loaded, but writes are withheld there | Same -- the fix is yours, not a workaround |
+
+Called with no arguments it lists every group with its availability and, for anything
+withheld, the exact environment change that would restore it. It reads no network and
+needs no credentials, so it works even when the server is misconfigured.
 
 ## Scoping writes to areas
 
