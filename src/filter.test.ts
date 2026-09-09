@@ -515,3 +515,46 @@ describe("parseGroupList", () => {
     }
   });
 });
+
+describe("TAILSCALE_WRITE_GROUPS composition gaps", () => {
+  it("reports a grant that TAILSCALE_PROFILE never loaded", () => {
+    // Every other not-loaded test drives this branch through TAILSCALE_TOOLS, but
+    // PROFILE is the knob a casual operator is far more likely to have set, and it
+    // reaches the same branch by a different path. PROFILES.minimal is
+    // status/devices/audit, so `acl` is a valid group the preset excludes.
+    const r = filterTools(groups, { profile: "minimal", writeGroups: "acl" });
+    assert.deepEqual(r.writeGroupsNotLoaded, ["acl"]);
+    assert.deepEqual(r.writeGroups, [], "the grant had nothing to apply to");
+    assert.equal(r.unknownWriteGroups, undefined, "spelled correctly -- the fix is the profile");
+    assert.deepEqual(
+      r.tools.map((t) => t.name),
+      ["list_devices"],
+      "the preset still decides what loads; the write grant cannot re-expand it",
+    );
+  });
+
+  it("grants the loaded half of a grant and reports the rest as not loaded", () => {
+    // Both arms of the same filter fire in one call. Existing tests exercise
+    // fully-loaded or fully-unloaded grants only, and the mixed case is where a
+    // wrong predicate silently drops the valid half.
+    const r = filterTools(groups, { tools: "devices,acl", writeGroups: "devices,dns" });
+    assert.deepEqual(r.writeGroups, ["devices"], "the loaded half is granted");
+    assert.deepEqual(r.writeGroupsNotLoaded, ["dns"], "the unloaded half is reported");
+    assert.deepEqual(
+      r.tools.map((t) => t.name).sort(),
+      ["delete_device", "get_acl", "list_devices"],
+      "acl loads read-only (granted nothing), devices loads writable, dns never loads",
+    );
+  });
+
+  it("dedupes and sorts the effective grant", () => {
+    // The Set dedupes and .sort() normalizes, but nothing pinned either -- and the
+    // rendered `write=` string is exactly what an operator diffs between two
+    // environments to confirm they match.
+    // Input order is deliberately NOT already sorted: "acl,devices,acl" dedupes to
+    // ["acl","devices"] via insertion order alone, so it proves dedup and says nothing
+    // about the sort. Leading with `devices` is what makes the sort observable.
+    const r = filterTools(groups, { writeGroups: "devices,acl,devices" });
+    assert.deepEqual(r.writeGroups, ["acl", "devices"], "deduped AND sorted, not insertion order");
+  });
+});

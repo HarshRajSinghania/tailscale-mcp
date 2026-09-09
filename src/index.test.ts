@@ -679,4 +679,36 @@ describe("TAILSCALE_WRITE_GROUPS wiring", () => {
     const stderr = await captureStartup({ ...API_KEY });
     assert.ok(!/write=/.test(stderr), "no gate configured means no write= segment");
   });
+
+  it("stays quiet about admin equivalence when the load filter excluded those groups", async () => {
+    // The warning derives from what REGISTERED, so the load filter is a third distinct
+    // way it can fall silent -- the other two (readonly, a non-admin grant) are covered
+    // and this one was not. TAILSCALE_TOOLS=devices never loads keys/users/acl, so
+    // there is nothing admin-equivalent to warn about even with no write gate at all.
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_TOOLS: "devices" });
+    assert.ok(!/admin-equivalent/.test(stderr), "an unloaded group cannot be written to");
+    assert.ok(!/write=/.test(stderr), "no write gate was configured");
+  });
+
+  it("reports a sentinel and a real typo together, hinting once", async () => {
+    // What a confused operator actually types. The hint is selected by a .some() over
+    // the filtered list, so a mixed input exercises a path neither pure case does.
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "all,devises" });
+    assert.match(stderr, /unknown group\(s\): all, devises/);
+    assert.match(stderr, /"all" is not a group name/);
+    assert.ok(!/TAILSCALE_READONLY=1 is the shipped spelling/.test(stderr), "one hint, not both");
+  });
+
+  it("treats a granted local-cli as a silent no-op once the opt-in is on", async () => {
+    // Mirror of the not-enabled warning: same name, and the only difference is whether
+    // the opt-in registered the group.
+    const stderr = await captureStartup({
+      ...API_KEY,
+      TAILSCALE_LOCAL_CLI: "1",
+      TAILSCALE_WRITE_GROUPS: "local-cli",
+    });
+    assert.match(stderr, /write=local-cli/);
+    assert.ok(!/not enabled in this process/.test(stderr), "it IS enabled here");
+    assert.ok(!/includes unknown group/.test(stderr), "and it is not a typo");
+  });
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { PROFILES } from "./filter.js";
+import { filterTools, PROFILES } from "./filter.js";
 import {
   buildToolGroups,
   buildToolMeta,
@@ -1086,6 +1086,40 @@ describe("formatBannerFilterSuffix write-gate rendering", () => {
         localCliEnabled: true,
       }),
       "profile=core, write=devices, local-cli=on",
+    );
+  });
+});
+
+describe("conditionally-registered groups", () => {
+  it("registers exactly one group behind an opt-in, so the not-enabled remedy stays correct", () => {
+    // A TRIPWIRE, not a repair. index.ts DERIVES the not-enabled set (diff the default
+    // registry against one built with every opt-in on) but its remedy sentence
+    // hardcodes "Set TAILSCALE_LOCAL_CLI=1". A second conditional group would be
+    // DETECTED correctly and then handed the WRONG FIX -- and the comment there claims
+    // such a group is "covered without touching this branch", which is only half true.
+    // If this goes red, that message needs to name the right variable per group.
+    const withOptIns = Object.keys(buildToolGroups({ TAILSCALE_LOCAL_CLI: "1" }));
+    const byDefault = Object.keys(buildToolGroups({}));
+    assert.deepEqual(
+      withOptIns.filter((g) => !byDefault.includes(g)),
+      ["local-cli"],
+      "a new opt-in group needs its own remedy text in index.ts's not-enabled warning",
+    );
+  });
+
+  it("treats a granted local-cli as a legal no-op once the opt-in is on", () => {
+    // The mirror of the not-enabled branch: same group name, opposite message. The
+    // condition choosing between "not enabled" and "fine, nothing to do" is the only
+    // thing separating a helpful diagnostic from a wrong one.
+    const groups = buildToolGroups({ TAILSCALE_LOCAL_CLI: "1" });
+    const r = filterTools(groups, { writeGroups: "local-cli" });
+    assert.deepEqual(r.writeGroups, ["local-cli"], "a real, loaded group -- the grant applies");
+    assert.equal(r.unknownWriteGroups, undefined, "not a typo once the opt-in is on");
+    assert.equal(r.writeGroupsNotLoaded, undefined, "it loaded");
+    assert.deepEqual(
+      r.tools.filter((t) => t.annotations.readOnlyHint !== true),
+      [],
+      "all six local-CLI diagnostics are reads, so the grant serves no writes",
     );
   });
 });
