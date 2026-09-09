@@ -5117,22 +5117,6 @@ describe("tailscale_diff_acl_access -- regressions found by review", () => {
     assert.match(res.error ?? "", /could not list users to diff/);
   });
 
-  it("discloses the posture-definition and port-range blind spots in the payload", async () => {
-    // Both are ways the diff comes back empty or misleading while real access
-    // changed, and both were found by review rather than by design. Keying on
-    // posture NAMES means redefining `posture:corp` more strictly leaves every
-    // key identical; the response-level posture definitions map is not read.
-    installFetch({
-      users: [{ loginName: "alice@example.com" }],
-      onPreview: (_p, principal) => ({ body: preview([{ ports: ["p:1"], lineNumber: 1 }], principal) }),
-    });
-
-    const res = await runDiff({ policy: '{"acls":[]}' });
-    assert.match(res.data?.scope ?? "", /posture DEFINITION/);
-    assert.match(res.data?.scope ?? "", /port list is narrowed/);
-    assert.match(res.data?.scope ?? "", /tags or groups/);
-  });
-
   it("stops on its own time budget and says so, rather than running past the client's timeout", async () => {
     // api.ts's request budget is read fresh per apiRequest, so it bounded each
     // of this tool's ~52 requests and never the call. A run that outlives the
@@ -5476,5 +5460,179 @@ describe("tailscale_diff_acl_access -- branch coverage", () => {
       res.data?.summary,
       "1 of 4 users could not be checked, 1 of 3 users compared lose access, 0 gain access, 2 unchanged",
     );
+  });
+});
+
+describe("tailscale_diff_acl_access -- posture definitions", () => {
+  const originalFetch = globalThis.fetch;
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    process.env.TAILSCALE_API_KEY = "tskey-api-test";
+    process.env.TAILSCALE_TAILNET = "test.ts.net";
+    delete process.env.TAILSCALE_OAUTH_CLIENT_ID;
+    delete process.env.TAILSCALE_OAUTH_CLIENT_SECRET;
+    globalThis.fetch = async () => mockFetchResponse(599, "no test installed a fetch stub");
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
+  });
+
+  const BASELINE = '{"acls":[{"action":"accept","src":["alice@example.com"],"dst":["tag:prod:22"]}]}';
+
+  /**
+   * A preview response in the shape a LIVE tailnet returns -- verified by probing the
+   * real API, not inferred from the Go struct. Two details came from that probe and
+   * are reproduced deliberately: `postures` on a match is an explicit `null` when the
+   * rule has no posture requirement, and the top-level definitions map is ABSENT
+   * entirely (not empty) when the submitted policy defines no postures.
+   */
+  function preview(
+    matches: Array<Record<string, unknown>>,
+    previewFor: string,
+    postureDefs?: Record<string, string[]>,
+  ) {
+    const body: Record<string, unknown> = { matches, type: "user", previewFor };
+    if (postureDefs) body.postures = postureDefs;
+    return body;
+  }
+
+  function installFetch(onPreview: (policy: string, principal: string) => unknown) {
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/acl/preview")) {
+        const principal = new URL(url).searchParams.get("previewFor") ?? "";
+        return mockFetchResponse(200, onPreview((init?.body as string) ?? "", principal));
+      }
+      if (url.includes("/users")) return mockFetchResponse(200, { users: [{ loginName: "alice@example.com" }] });
+      if (url.includes("/acl")) return mockFetchResponse(200, BASELINE);
+      return mockFetchResponse(599, "unexpected URL");
+    };
+  }
+
+  async function runDiff() {
+    const { aclTools } = await import("./tools/acl.js");
+    return (await findTool(aclTools, "tailscale_diff_acl_access").handler({ policy: '{"acls":[]}' })) as {
+      ok: boolean;
+      data?: {
+        scope: string;
+        changed: Array<{ principal: string; lost: string[]; gained: string[] }>;
+        unchanged: string[];
+      };
+    };
+  }
+
+  it("detects a posture DEFINITION tightening that leaves every name identical", async () => {
+    // The silent false-clean this fix exists for. The rule, the destination and the
+    // posture NAME are byte-identical on both sides; only the definition moved, and
+    // every device below the new version bound loses the destination. Before the
+    // fix this reported "unchanged" for the whole tailnet.
+    installFetch((policy, principal) =>
+      policy === BASELINE
+        ? preview([{ ports: ["tag:prod:22"], postures: ["posture:corp"], lineNumber: 3 }], principal, {
+            "posture:corp": ["node:os == 'macos'"],
+          })
+        : preview([{ ports: ["tag:prod:22"], postures: ["posture:corp"], lineNumber: 3 }], principal, {
+            "posture:corp": ["node:os == 'macos'", "node:tsVersion >= '1.80'"],
+          }),
+    );
+
+    const res = await runDiff();
+    assert.equal(res.data?.changed.length, 1, "a redefinition must not read as unchanged");
+    assert.deepEqual(res.data?.changed[0]?.lost, ["tag:prod:22 posture posture:corp(node:os == 'macos')"]);
+    assert.deepEqual(res.data?.changed[0]?.gained, [
+      "tag:prod:22 posture posture:corp(node:os == 'macos';node:tsVersion >= '1.80')",
+    ]);
+  });
+
+  it("treats a reordered definition as unchanged", async () => {
+    // The rules are a set, not a sequence; without the sort a reordered definition
+    // would read as a tightening and the tool would cry wolf.
+    installFetch((policy, principal) =>
+      policy === BASELINE
+        ? preview([{ ports: ["p:1"], postures: ["posture:corp"], lineNumber: 1 }], principal, {
+            "posture:corp": ["a == 1", "b == 2"],
+          })
+        : preview([{ ports: ["p:1"], postures: ["posture:corp"], lineNumber: 1 }], principal, {
+            "posture:corp": ["b == 2", "a == 1"],
+          }),
+    );
+
+    const res = await runDiff();
+    assert.deepEqual(res.data?.changed, []);
+    assert.deepEqual(res.data?.unchanged, ["alice@example.com"]);
+  });
+
+  it("falls back to names when only ONE side supplies definitions", async () => {
+    // Resolving one side and not the other would manufacture a change on every
+    // posture-gated grant -- an API-shape difference read as a security finding.
+    // Under-reporting here is the safe direction for a tool that must not cry wolf.
+    installFetch((policy, principal) =>
+      policy === BASELINE
+        ? preview([{ ports: ["p:1"], postures: ["posture:corp"], lineNumber: 1 }], principal, {
+            "posture:corp": ["node:os == 'macos'"],
+          })
+        : preview([{ ports: ["p:1"], postures: ["posture:corp"], lineNumber: 1 }], principal),
+    );
+
+    const res = await runDiff();
+    assert.deepEqual(res.data?.changed, [], "a missing map must not invent a change");
+    assert.deepEqual(res.data?.unchanged, ["alice@example.com"]);
+  });
+
+  it("still detects a posture being ADDED, which the name alone carries", async () => {
+    installFetch((policy, principal) =>
+      policy === BASELINE
+        ? preview([{ ports: ["p:1"], postures: null, lineNumber: 1 }], principal)
+        : preview([{ ports: ["p:1"], postures: ["posture:corp"], lineNumber: 1 }], principal, {
+            "posture:corp": ["node:os == 'macos'"],
+          }),
+    );
+
+    const res = await runDiff();
+    assert.equal(res.data?.changed.length, 1);
+    assert.deepEqual(res.data?.changed[0]?.lost, ["p:1"]);
+    assert.deepEqual(res.data?.changed[0]?.gained, ["p:1 posture posture:corp"]);
+  });
+
+  it("tolerates the explicit null a live tailnet returns for a postureless match", async () => {
+    // Probed shape: matches carry `"postures": null`, not an absent key. `?? []`
+    // handles both, and this pins that a stricter read would break against the API.
+    installFetch((_policy, principal) => preview([{ ports: ["p:1"], postures: null, lineNumber: 1 }], principal));
+    const res = await runDiff();
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.data?.unchanged, ["alice@example.com"]);
+  });
+
+  it("keeps a name unresolved by the map in its bare form", async () => {
+    // `name()` would collide with a genuinely empty definition, so an unresolvable
+    // name stays bare rather than rendering empty parentheses.
+    installFetch((policy, principal) =>
+      policy === BASELINE
+        ? preview([{ ports: ["p:1"], postures: ["posture:ghost"], lineNumber: 1 }], principal, {
+            "posture:other": ["x"],
+          })
+        : preview([{ ports: ["p:1"], postures: ["posture:ghost"], lineNumber: 1 }], principal, {
+            "posture:other": ["x"],
+          }),
+    );
+    const res = await runDiff();
+    assert.deepEqual(res.data?.changed, [], "an unresolvable name is stable across both sides");
+  });
+
+  it("states the corrected scope: postures compared, no port-range caveat", async () => {
+    // The port-range limitation was DISPROVED against the live API -- `ip: [22,80,443]`
+    // returns three separate port entries, never a comma-joined one -- so claiming it
+    // told operators the tool was less precise than it is.
+    installFetch((_policy, principal) => preview([{ ports: ["p:1"], lineNumber: 1 }], principal));
+    const res = await runDiff();
+    assert.match(res.data?.scope ?? "", /Posture definition changes ARE compared/);
+    assert.match(res.data?.scope ?? "", /tags or groups/);
+    assert.ok(!/port list is narrowed/.test(res.data?.scope ?? ""), "that limitation does not exist");
   });
 });
