@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > theory that its absence had degraded that release's notes. Keep entries here
 > current for readers; it will not change what `gh release` shows.
 
-## [Unreleased]
+## [0.19.0] — 2026-09-09
 
 ### Added
 - **`tailscale_tool_groups` explains the server's own configuration to the agent.** Always registered, whatever the filters say. Every other diagnostic here goes to stderr -- which the operator reads and the model never does -- so a withheld tool and a tool that was never built are the same observation to an agent, and only one of them means "find another way". That ambiguity is what makes an agent invent a workaround: shelling out to curl, or editing the ACL to achieve what a withheld device call would have done, which is worse than the call the operator withheld.
