@@ -5,7 +5,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/YawLabs/tailscale-mcp)](https://github.com/YawLabs/tailscale-mcp/stargazers)
 [![Release](https://img.shields.io/badge/release-local-blue)](./release.sh)
 
-**Ask your agent questions about your tailnet and have it act on the answers.** 96 admin-API tools + 6 optional local-CLI diagnostics + 4 resources spanning the [Tailscale v2 API](https://tailscale.com/api) — devices, ACLs, DNS, keys and trust credentials, users, invites, webhooks, log streaming, posture, services, and organization tailnets. Backed by 1100+ unit tests and an opt-in live-tailnet integration suite.
+**Ask your agent questions about your tailnet and have it act on the answers.** 97 admin-API tools + 6 optional local-CLI diagnostics + 4 resources spanning the [Tailscale v2 API](https://tailscale.com/api) — devices, ACLs, DNS, keys and trust credentials, users, invites, webhooks, log streaming, posture, services, and organization tailnets. Backed by 1100+ unit tests and an opt-in live-tailnet integration suite.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
@@ -104,7 +104,7 @@ That's it. Now ask your agent:
 
 ## Too many tools? Subset them.
 
-96 tools is a lot. If you've already got a dozen MCP servers and your client is feeling heavy, trim what this one exposes. Three knobs, combinable:
+97 tools is a lot. If you've already got a dozen MCP servers and your client is feeling heavy, trim what this one exposes. Three knobs, combinable:
 
 > The `env` blocks below show only the variable under discussion. Your credentials come from the environment, as set in [Quick start](#quick-start) — keep them in your shell profile rather than in the client's JSON config, which is world-readable on most systems and easy to commit by accident.
 
@@ -119,8 +119,8 @@ That's it. Now ask your agent:
 ```
 
 - **`minimal`** (20 tools) — `status`, `devices`, `audit`. Observe the tailnet, read the audit log.
-- **`core`** (51 tools) — adds `acl`, `dns`, `keys`, `users`. The day-to-day admin surface.
-- **`full`** (96 tools, default) — everything. Same as omitting the env var.
+- **`core`** (52 tools) — adds `acl`, `dns`, `keys`, `users`. The day-to-day admin surface.
+- **`full`** (97 tools, default) — everything. Same as omitting the env var.
 
 ### Option 2: `TAILSCALE_TOOLS` (explicit group list)
 
@@ -160,7 +160,7 @@ The server logs the active filter to stderr on startup:
 When both `TAILSCALE_PROFILE` and `TAILSCALE_TOOLS` are set, `TAILSCALE_TOOLS` wins. The banner marks the profile as overridden so the precedence is obvious at a glance — no need to guess which filter actually applied:
 
 ```
-@yawlabs/tailscale-mcp v0.12.0 ready (21 tools, profile=core (overridden by TAILSCALE_TOOLS), groups=devices,acl)
+@yawlabs/tailscale-mcp v0.12.0 ready (22 tools, profile=core (overridden by TAILSCALE_TOOLS), groups=devices,acl)
 ```
 
 The "(overridden)" marker only fires for substantive profiles (`minimal` / `core`); `profile=full` is a no-op preset, so it's shown without the marker when `TAILSCALE_TOOLS` is also set.
@@ -260,7 +260,7 @@ Set `TAILSCALE_LOCAL_CLI=1` (in your shell or `.mcp.json` `env` block) to add si
 
 Requirements: the `tailscale` binary must be in `PATH`. If it's installed somewhere unusual, set `TAILSCALE_BINARY` to its absolute path. The MCP server doesn't need root to run these — they're all diagnostic, not state-mutating. Operations that would need elevation (`tailscale up`, `set --advertise-routes`, `lock sign`) are deliberately not exposed.
 
-When opt-in is on, the startup banner reflects it: `@yawlabs/tailscale-mcp v0.13.3 ready (102 tools, local-cli=on)` — the 6 local CLI tools are additive on top of the default 96.
+When opt-in is on, the startup banner reflects it: `@yawlabs/tailscale-mcp v0.13.3 ready (103 tools, local-cli=on)` — the 6 local CLI tools are additive on top of the default 97.
 
 ## Resources (4)
 
@@ -273,7 +273,7 @@ MCP Resources expose read-only data clients can browse without a tool call.
 | ACL Policy | `tailscale://tailnet/acl` | Full ACL policy (HuJSON preserved) |
 | DNS Config | `tailscale://tailnet/dns` | Nameservers, search paths, split DNS, MagicDNS |
 
-## Tools (96 + 6 opt-in)
+## Tools (97 + 6 opt-in)
 
 <details>
 <summary><strong>Status</strong> (1 tool)</summary>
@@ -310,7 +310,7 @@ MCP Resources expose read-only data clients can browse without a tool call.
 </details>
 
 <details>
-<summary><strong>ACL / Policy</strong> (4 tools) — with HuJSON formatting preservation and ETag safety</summary>
+<summary><strong>ACL / Policy</strong> (5 tools) — with HuJSON formatting preservation and ETag safety</summary>
 
 | Tool | Description |
 |------|-------------|
@@ -318,6 +318,7 @@ MCP Resources expose read-only data clients can browse without a tool call.
 | `tailscale_update_acl` | Update ACL policy (requires ETag for safe concurrent edits) |
 | `tailscale_validate_acl` | Validate a policy without applying it |
 | `tailscale_preview_acl` | Preview rules that would apply to a user or IP |
+| `tailscale_diff_acl_access` | Compare a proposed policy against the live one — who gains and loses access |
 
 </details>
 
@@ -571,7 +572,7 @@ This shows a read-only banner in the Tailscale Admin Console pointing to your re
 
 ## Running on oam.js (optional)
 
-[oam.js](https://oamjs.org) runs this server unmodified. Verified against oam 0.9.0: full MCP handshake, all 96 tools, all 4 resources, identical error messages, and a clean stdout protocol stream — from the shipped bundle *and* straight from the TypeScript source with no build step.
+[oam.js](https://oamjs.org) runs this server unmodified. Verified against oam 0.9.0: full MCP handshake, all 97 tools, all 4 resources, identical error messages, and a clean stdout protocol stream — from the shipped bundle *and* straight from the TypeScript source with no build step.
 
 **oam 0.9.0 is the minimum.** Older releases ran `child_process.execFile` arguments through a shell, re-splitting them on whitespace and executing shell metacharacters inside an argument. This server shells out to the `tailscale` binary across its local-CLI tools, so that was a reachable bug rather than a theoretical one. The launcher enforces the floor: given an older oam it falls back to Node and says so on stderr, and `TAILSCALE_MCP_RUNTIME=oam` turns that into a hard error.
 

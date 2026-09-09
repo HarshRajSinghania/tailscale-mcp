@@ -149,6 +149,10 @@ export const MAX_RESULT_SIZE_CHARS = 500_000;
  * would say nothing and cost bytes in every `tools/list`.
  */
 export const LARGE_RESULT_TOOLS: readonly string[] = [
+  // Scales with BOTH the number of principals checked and each one's grant
+  // count, so for a given tailnet its payload is strictly larger than
+  // list_users below.
+  "tailscale_diff_acl_access",
   "tailscale_get_acl",
   "tailscale_get_audit_log",
   "tailscale_get_network_flow_logs",

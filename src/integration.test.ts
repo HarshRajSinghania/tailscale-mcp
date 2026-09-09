@@ -278,3 +278,120 @@ describe("Integration: tailscale_create_key keyType=federated round-trip", { ski
     }
   });
 });
+
+/**
+ * The /acl/preview response shape, which tailscale_diff_acl_access depends on
+ * entirely and which no unit test can verify: every fixture in handlers.test.ts
+ * is a hand-written guess at the wire format, derived from the Go client's
+ * ACLPreviewResponse / UserRuleMatch structs rather than from an observed
+ * response.
+ *
+ * A POST, but read-only in effect: preview evaluates a policy and applies
+ * nothing. The policy submitted here is the tailnet's OWN current policy, so
+ * even a hypothetical server-side misroute could not change the effective
+ * configuration.
+ *
+ * Two open questions are recorded via t.diagnostic() rather than asserted,
+ * because the correct answer is unknown and asserting a guess is how a fixture
+ * ends up pinning a shape the API never sends. Both gate documented blind spots
+ * in tailscale_diff_acl_access -- see the `scope` string it returns and the
+ * CHANGELOG entry. Run this suite to answer them:
+ *
+ *   1. Does the response carry a top-level `postures` map? If it does, and it
+ *      holds the submitted policy's posture DEFINITIONS, the posture-definition
+ *      blind spot becomes fixable: the diff could key on definitions instead of
+ *      names, and a tightened `posture:corp` would stop reading as unchanged.
+ *   2. Does a single `ports` entry ever carry a comma-joined port list
+ *      ("tag:prod:22,80")? That is what makes a narrowed port range surface as a
+ *      paired loss and gain of the whole entry rather than a clean loss.
+ */
+describe("Integration: ACL preview response shape", { skip: !runIntegration }, () => {
+  it("returns a matches array whose elements carry the fields the diff keys on", async (t) => {
+    const { aclTools } = await import("./tools/acl.js");
+    const { userTools } = await import("./tools/users.js");
+
+    const getAcl = aclTools.find((tool) => tool.name === "tailscale_get_acl");
+    const listUsers = userTools.find((tool) => tool.name === "tailscale_list_users");
+    assert.ok(getAcl, "tailscale_get_acl tool not found");
+    assert.ok(listUsers, "tailscale_list_users tool not found");
+
+    // Strip the ETag footer tailscale_get_acl appends: it is valid HuJSON, but
+    // the baseline should be the policy as stored.
+    const aclResult = (await (getAcl.handler as () => Promise<ApiResult<unknown>>)()) as ApiResult<unknown>;
+    assert.equal(aclResult.ok, true, `could not read the ACL: ${aclResult.error ?? "(no error)"}`);
+    const policy = (aclResult.rawBody ?? "").split("\n// ETag:")[0];
+    assert.ok(policy.trim().length > 0, "expected a non-empty ACL body to preview against");
+
+    const usersResult = (await (
+      listUsers.handler as (
+        input: Record<string, unknown>,
+      ) => Promise<ApiResult<{ users?: Array<Record<string, unknown>> }>>
+    )({})) as ApiResult<{ users?: Array<Record<string, unknown>> }>;
+    assert.equal(usersResult.ok, true, `could not list users: ${usersResult.error ?? "(no error)"}`);
+    const users = usersResult.data?.users ?? [];
+    // Same precondition rationale as the device/key suites above: an empty
+    // tailnet would let every assertion below pass without inspecting a field.
+    assert.ok(users.length > 0, "target tailnet has no users; this suite cannot check the preview shape");
+
+    // The field tailscale_diff_acl_access resolves principals from. If this is
+    // ever not a string on a live tailnet, that tool's fallback chain is load
+    // bearing and its blind-spot disclosure needs revisiting.
+    const loginName = users[0]?.loginName;
+    assert.equal(typeof loginName, "string", "expected users[].loginName to be a string on the live API");
+
+    const preview = aclTools.find((tool) => tool.name === "tailscale_preview_acl");
+    assert.ok(preview, "tailscale_preview_acl tool not found");
+    const result = (await (
+      preview.handler as (input: { policy: string; type: string; previewFor: string }) => Promise<ApiResult<unknown>>
+    )({ policy, type: "user", previewFor: loginName as string })) as ApiResult<unknown>;
+    assert.equal(result.ok, true, `preview failed: ${result.error ?? "(no error)"}`);
+
+    // previewAccess parses rawBody itself rather than letting apiRequest do it,
+    // so this mirrors that path exactly.
+    const parsed = JSON.parse(result.rawBody ?? "") as {
+      matches?: unknown;
+      postures?: unknown;
+      type?: unknown;
+      previewFor?: unknown;
+    };
+
+    // The hard dependency: previewAccess treats an absent matches array as a
+    // failure precisely so a shape change cannot read as "reaches nothing".
+    assert.ok(Array.isArray(parsed.matches), `expected a matches array, got: ${JSON.stringify(parsed).slice(0, 400)}`);
+
+    const matches = parsed.matches as Array<Record<string, unknown>>;
+    for (const match of matches) {
+      if (match.ports !== undefined) assert.ok(Array.isArray(match.ports), "ports must be an array when present");
+      if (match.via !== undefined) assert.ok(Array.isArray(match.via), "via must be an array when present");
+      if (match.postures !== undefined) {
+        assert.ok(Array.isArray(match.postures), "match.postures must be an array of NAMES when present");
+      }
+    }
+
+    // ---- Open question 1: the response-level postures map ----
+    const posturesMap = parsed.postures;
+    if (posturesMap === undefined) {
+      t.diagnostic(
+        "preview response has NO top-level `postures` map -- the posture-definition blind spot is unfixable from this response alone",
+      );
+    } else {
+      t.diagnostic(`preview response HAS a top-level \`postures\` map: ${JSON.stringify(posturesMap).slice(0, 600)}`);
+      t.diagnostic(
+        "if that map holds the submitted policy's posture DEFINITIONS, the posture-definition blind spot in tailscale_diff_acl_access is fixable -- key on definitions, not names",
+      );
+    }
+
+    // ---- Open question 2: comma-joined port lists ----
+    const allPorts = matches.flatMap((m) => (Array.isArray(m.ports) ? (m.ports as unknown[]) : []));
+    const commaJoined = allPorts.filter((p) => typeof p === "string" && p.includes(","));
+    if (commaJoined.length > 0) {
+      t.diagnostic(
+        `ports entries DO carry comma-joined lists (e.g. ${JSON.stringify(commaJoined[0])}) -- confirms the narrowed-port-range blind spot is real`,
+      );
+    } else {
+      t.diagnostic(
+        `no comma-joined ports entry seen in ${allPorts.length} entries on this tailnet -- inconclusive, not proof the blind spot is absent`,
+      );
+    }
+  });
+});
