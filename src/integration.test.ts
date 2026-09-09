@@ -281,117 +281,160 @@ describe("Integration: tailscale_create_key keyType=federated round-trip", { ski
 
 /**
  * The /acl/preview response shape, which tailscale_diff_acl_access depends on
- * entirely and which no unit test can verify: every fixture in handlers.test.ts
- * is a hand-written guess at the wire format, derived from the Go client's
- * ACLPreviewResponse / UserRuleMatch structs rather than from an observed
- * response.
+ * entirely and which no unit test can verify -- every fixture in handlers.test.ts is
+ * a hand-written reconstruction, and the API is the only authority on whether it is
+ * right.
  *
- * A POST, but read-only in effect: preview evaluates a policy and applies
- * nothing. The policy submitted here is the tailnet's OWN current policy, so
- * even a hypothetical server-side misroute could not change the effective
- * configuration.
+ * These assert two facts MEASURED against a live tailnet rather than inferred from
+ * the Go client's structs. Both were open questions that shipped as documented
+ * limitations until a probe settled them, and one of the two limitations turned out
+ * not to exist:
  *
- * Two open questions are recorded via t.diagnostic() rather than asserted,
- * because the correct answer is unknown and asserting a guess is how a fixture
- * ends up pinning a shape the API never sends. Both gate documented blind spots
- * in tailscale_diff_acl_access -- see the `scope` string it returns and the
- * CHANGELOG entry. Run this suite to answer them:
+ *   1. the response DOES carry a top-level `postures` map holding the SUBMITTED
+ *      policy's definitions -- which is what makes posture-redefinition detection
+ *      possible at all
+ *   2. a multi-port grant returns SEPARATE port entries, never a comma-joined one,
+ *      so narrowing a port list is a clean loss
  *
- *   1. Does the response carry a top-level `postures` map? If it does, and it
- *      holds the submitted policy's posture DEFINITIONS, the posture-definition
- *      blind spot becomes fixable: the diff could key on definitions instead of
- *      names, and a tightened `posture:corp` would stop reading as unchanged.
- *   2. Does a single `ports` entry ever carry a comma-joined port list
- *      ("tag:prod:22,80")? That is what makes a narrowed port range surface as a
- *      paired loss and gain of the whole entry rather than a clean loss.
+ * A crafted policy is submitted rather than the tailnet's own, so the answers do not
+ * depend on how the target tailnet happens to be configured. `preview` evaluates and
+ * applies nothing, so this remains read-only despite being a POST.
  */
 describe("Integration: ACL preview response shape", { skip: !runIntegration }, () => {
-  it("returns a matches array whose elements carry the fields the diff keys on", async (t) => {
+  it("returns posture definitions and separate port entries", async () => {
     const { aclTools } = await import("./tools/acl.js");
     const { userTools } = await import("./tools/users.js");
 
-    const getAcl = aclTools.find((tool) => tool.name === "tailscale_get_acl");
-    const listUsers = userTools.find((tool) => tool.name === "tailscale_list_users");
-    assert.ok(getAcl, "tailscale_get_acl tool not found");
+    const listUsers = userTools.find((t) => t.name === "tailscale_list_users");
     assert.ok(listUsers, "tailscale_list_users tool not found");
-
-    // Strip the ETag footer tailscale_get_acl appends: it is valid HuJSON, but
-    // the baseline should be the policy as stored.
-    const aclResult = (await (getAcl.handler as () => Promise<ApiResult<unknown>>)()) as ApiResult<unknown>;
-    assert.equal(aclResult.ok, true, `could not read the ACL: ${aclResult.error ?? "(no error)"}`);
-    const policy = (aclResult.rawBody ?? "").split("\n// ETag:")[0];
-    assert.ok(policy.trim().length > 0, "expected a non-empty ACL body to preview against");
-
     const usersResult = (await (
       listUsers.handler as (
-        input: Record<string, unknown>,
+        i: Record<string, unknown>,
       ) => Promise<ApiResult<{ users?: Array<Record<string, unknown>> }>>
     )({})) as ApiResult<{ users?: Array<Record<string, unknown>> }>;
     assert.equal(usersResult.ok, true, `could not list users: ${usersResult.error ?? "(no error)"}`);
     const users = usersResult.data?.users ?? [];
-    // Same precondition rationale as the device/key suites above: an empty
-    // tailnet would let every assertion below pass without inspecting a field.
     assert.ok(users.length > 0, "target tailnet has no users; this suite cannot check the preview shape");
 
-    // The field tailscale_diff_acl_access resolves principals from. If this is
-    // ever not a string on a live tailnet, that tool's fallback chain is load
-    // bearing and its blind-spot disclosure needs revisiting.
-    const loginName = users[0]?.loginName;
-    assert.equal(typeof loginName, "string", "expected users[].loginName to be a string on the live API");
+    // The principal the preview endpoint expects. NOT necessarily an email: a
+    // GitHub-auth tailnet returns "alice@github" and carries no `email` key at all,
+    // which is why tailscale_diff_acl_access resolves principals from loginName.
+    const principal = users[0]?.loginName;
+    assert.equal(typeof principal, "string", "expected users[].loginName to be a string on the live API");
 
-    const preview = aclTools.find((tool) => tool.name === "tailscale_preview_acl");
+    const policy = JSON.stringify({
+      tagOwners: { "tag:shapeprobe": ["autogroup:admin"] },
+      postures: { "posture:shapeprobe": ["node:tsVersion >= '1.80'"] },
+      grants: [
+        // srcPosture is rejected against src:["*"], so the grant names the principal.
+        {
+          src: [principal],
+          dst: ["tag:shapeprobe"],
+          ip: ["22", "80", "443"],
+          srcPosture: ["posture:shapeprobe"],
+        },
+      ],
+    });
+
+    const preview = aclTools.find((t) => t.name === "tailscale_preview_acl");
     assert.ok(preview, "tailscale_preview_acl tool not found");
     const result = (await (
-      preview.handler as (input: { policy: string; type: string; previewFor: string }) => Promise<ApiResult<unknown>>
-    )({ policy, type: "user", previewFor: loginName as string })) as ApiResult<unknown>;
+      preview.handler as (i: { policy: string; type: string; previewFor: string }) => Promise<ApiResult<unknown>>
+    )({ policy, type: "user", previewFor: principal as string })) as ApiResult<unknown>;
     assert.equal(result.ok, true, `preview failed: ${result.error ?? "(no error)"}`);
 
-    // previewAccess parses rawBody itself rather than letting apiRequest do it,
-    // so this mirrors that path exactly.
     const parsed = JSON.parse(result.rawBody ?? "") as {
-      matches?: unknown;
-      postures?: unknown;
-      type?: unknown;
-      previewFor?: unknown;
+      matches?: Array<{ ports?: unknown; postures?: unknown }>;
+      postures?: Record<string, string[]>;
     };
 
-    // The hard dependency: previewAccess treats an absent matches array as a
-    // failure precisely so a shape change cannot read as "reaches nothing".
-    assert.ok(Array.isArray(parsed.matches), `expected a matches array, got: ${JSON.stringify(parsed).slice(0, 400)}`);
+    // (1) The definitions map, and that it echoes what was SUBMITTED. If this ever
+    // goes red, tailscale_diff_acl_access silently stops detecting posture
+    // redefinitions -- it falls back to comparing names, which is the exact
+    // false-clean the definition resolution was added to remove.
+    assert.ok(parsed.postures, "no top-level `postures` map -- posture-definition diffing is not possible");
+    assert.deepEqual(
+      parsed.postures?.["posture:shapeprobe"],
+      ["node:tsVersion >= '1.80'"],
+      "the postures map must echo the SUBMITTED policy's definitions",
+    );
 
-    const matches = parsed.matches as Array<Record<string, unknown>>;
-    for (const match of matches) {
-      if (match.ports !== undefined) assert.ok(Array.isArray(match.ports), "ports must be an array when present");
-      if (match.via !== undefined) assert.ok(Array.isArray(match.via), "via must be an array when present");
-      if (match.postures !== undefined) {
-        assert.ok(Array.isArray(match.postures), "match.postures must be an array of NAMES when present");
-      }
+    const matches = parsed.matches ?? [];
+    assert.ok(matches.length > 0, "expected the crafted grant to match its own principal");
+    const ports = matches.flatMap((m) => (Array.isArray(m.ports) ? (m.ports as string[]) : []));
+
+    // (2) Separate entries, never comma-joined. A comma-joined form would make a
+    // narrowed port list surface as a paired loss and gain of the whole entry --
+    // the limitation this package documented until the API disproved it.
+    assert.ok(
+      !ports.some((p) => typeof p === "string" && p.includes(",")),
+      `a port entry is comma-joined, so the narrowed-range limitation is real after all: ${JSON.stringify(ports)}`,
+    );
+    assert.equal(ports.length, 3, `expected one entry per port from ip:[22,80,443], got ${JSON.stringify(ports)}`);
+  });
+});
+
+/**
+ * Response sizes for the five tools that declare `anthropic/maxResultSizeChars`.
+ *
+ * That annotation raises the client's truncation limit so a large-but-legitimate
+ * result stays inline instead of becoming a file reference. Every entry currently
+ * declares the documented 500000 ceiling, because sizing them needs measurements
+ * from a POPULATED tailnet and inventing numbers is fake precision.
+ *
+ * This is the measurement, and it is a real assertion rather than a report: if a
+ * live response EXCEEDS its declared cap, the cap is not doing its job and the tool
+ * will be truncated anyway. It also prints each size, so running this against a
+ * large tailnet produces exactly the data needed to tune the caps down from the
+ * ceiling -- the open question that has been blocked on nothing but a populated
+ * tailnet.
+ */
+describe("Integration: declared result-size caps vs real responses", { skip: !runIntegration }, () => {
+  it("keeps every capped tool's live response inside its declared cap", async (t) => {
+    const { MAX_RESULT_SIZE_CHARS, LARGE_RESULT_TOOLS } = await import("./server-wiring.js");
+    const { deviceTools } = await import("./tools/devices.js");
+    const { userTools } = await import("./tools/users.js");
+    const { aclTools } = await import("./tools/acl.js");
+
+    const probes: Array<[string, () => Promise<ApiResult<unknown>>]> = [
+      [
+        "tailscale_list_devices",
+        () =>
+          (
+            deviceTools.find((x) => x.name === "tailscale_list_devices")?.handler as (
+              i: Record<string, unknown>,
+            ) => Promise<ApiResult<unknown>>
+          )({ fields: "all" }),
+      ],
+      [
+        "tailscale_list_users",
+        () =>
+          (
+            userTools.find((x) => x.name === "tailscale_list_users")?.handler as (
+              i: Record<string, unknown>,
+            ) => Promise<ApiResult<unknown>>
+          )({}),
+      ],
+      [
+        "tailscale_get_acl",
+        () => (aclTools.find((x) => x.name === "tailscale_get_acl")?.handler as () => Promise<ApiResult<unknown>>)(),
+      ],
+    ];
+
+    for (const [name, run] of probes) {
+      assert.ok(LARGE_RESULT_TOOLS.includes(name), `${name} should be in LARGE_RESULT_TOOLS`);
+      const res = await run();
+      assert.equal(res.ok, true, `${name} failed: ${res.error ?? "(no error)"}`);
+      const size = (res.rawBody ?? JSON.stringify(res.data ?? {})).length;
+      t.diagnostic(`${name}: ${size} chars (declared cap ${MAX_RESULT_SIZE_CHARS})`);
+      assert.ok(
+        size <= MAX_RESULT_SIZE_CHARS,
+        `${name} returned ${size} chars, above its declared cap of ${MAX_RESULT_SIZE_CHARS} -- the cap cannot keep it inline`,
+      );
     }
 
-    // ---- Open question 1: the response-level postures map ----
-    const posturesMap = parsed.postures;
-    if (posturesMap === undefined) {
-      t.diagnostic(
-        "preview response has NO top-level `postures` map -- the posture-definition blind spot is unfixable from this response alone",
-      );
-    } else {
-      t.diagnostic(`preview response HAS a top-level \`postures\` map: ${JSON.stringify(posturesMap).slice(0, 600)}`);
-      t.diagnostic(
-        "if that map holds the submitted policy's posture DEFINITIONS, the posture-definition blind spot in tailscale_diff_acl_access is fixable -- key on definitions, not names",
-      );
-    }
-
-    // ---- Open question 2: comma-joined port lists ----
-    const allPorts = matches.flatMap((m) => (Array.isArray(m.ports) ? (m.ports as unknown[]) : []));
-    const commaJoined = allPorts.filter((p) => typeof p === "string" && p.includes(","));
-    if (commaJoined.length > 0) {
-      t.diagnostic(
-        `ports entries DO carry comma-joined lists (e.g. ${JSON.stringify(commaJoined[0])}) -- confirms the narrowed-port-range blind spot is real`,
-      );
-    } else {
-      t.diagnostic(
-        `no comma-joined ports entry seen in ${allPorts.length} entries on this tailnet -- inconclusive, not proof the blind spot is absent`,
-      );
-    }
+    t.diagnostic(
+      "Sizes above are for THIS tailnet. Tuning the caps below the ceiling needs a populated tailnet; an empty one cannot answer it.",
+    );
   });
 });

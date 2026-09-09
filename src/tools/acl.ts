@@ -23,13 +23,32 @@ const DEFAULT_PRINCIPAL_CAP = 25;
 // useful knob for "check fewer users" already exists as maxPrincipals.
 const DIFF_TIME_BUDGET_MS = 60_000;
 
-/** One rule match as the preview endpoint returns it (Go: UserRuleMatch). */
+/**
+ * One rule match as the preview endpoint returns it (Go: UserRuleMatch).
+ *
+ * `postures` is `string[] | null`, not optional-undefined: a live tailnet returns an
+ * explicit `null` on a match with no posture requirement (verified against the API,
+ * not inferred from the struct). Every read here uses `?? []`, which handles both.
+ */
 interface UserRuleMatch {
   users?: string[];
   ports?: string[];
   lineNumber?: number;
   via?: string[];
-  postures?: string[];
+  postures?: string[] | null;
+}
+
+/**
+ * The preview response envelope.
+ *
+ * `postures` maps a posture NAME to the rule expressions that define it, taken from
+ * the policy that was submitted. Verified against a live tailnet: previewing a policy
+ * carrying `postures: {"posture:x": ["node:tsVersion >= '1.80'"]}` echoes exactly that
+ * map back. The key is absent entirely when the submitted policy defines no postures.
+ */
+interface PreviewResponse {
+  matches?: UserRuleMatch[];
+  postures?: Record<string, string[]> | null;
 }
 
 /**
@@ -52,17 +71,47 @@ interface UserRuleMatch {
  * attached to reaching them -- is the answer to "what can this principal get
  * to, and under what conditions", which is the question being asked.
  *
+ * POSTURES ARE RESOLVED TO THEIR DEFINITIONS, not keyed by name. Keying on the name
+ * alone was a silent false-clean on the one tool whose entire value is being
+ * believed: tightening `posture:corp` from `["node:os == 'macos'"]` to also require
+ * a client version changes who can reach every posture-gated destination, while the
+ * NAME on every match stays byte-identical, so the diff reported "unchanged" for the
+ * whole tailnet. The response carries the submitted policy's definitions (verified
+ * against a live tailnet), so folding them into the key makes that change visible.
+ *
+ * `definitionsAvailable` gates it: fold definitions only when BOTH previews supplied
+ * a postures map. If one side omitted it -- an older API, or a policy that defines no
+ * postures at all -- resolving one side and not the other would manufacture a change
+ * on every posture-gated grant. Falling back to names-only there under-reports rather
+ * than over-reports, which is the safe direction for a tool that must not cry wolf.
+ *
  * A match carrying no ports contributes nothing: it grants no enumerable
  * destination, so there is nothing to gain or lose.
  */
-function accessSet(matches: UserRuleMatch[]): Set<string> {
+function accessSet(
+  matches: UserRuleMatch[],
+  postureDefs: Record<string, string[]> | null | undefined,
+  definitionsAvailable: boolean,
+): Set<string> {
   const out = new Set<string>();
   for (const match of matches) {
     const via = [...(match.via ?? [])].sort();
     const postures = [...(match.postures ?? [])].sort();
-    const qualifier = `${via.length > 0 ? ` via ${via.join(",")}` : ""}${
-      postures.length > 0 ? ` posture ${postures.join(",")}` : ""
-    }`;
+    const posturePart =
+      postures.length > 0
+        ? ` posture ${postures
+            .map((name) => {
+              if (!definitionsAvailable) return name;
+              // Sorted so a reordered definition is not read as a redefinition.
+              const rules = [...(postureDefs?.[name] ?? [])].sort();
+              // A name the map does not resolve keeps its bare form rather than
+              // rendering an empty `name()`, which would collide with a genuinely
+              // empty definition.
+              return rules.length > 0 ? `${name}(${rules.join(";")})` : name;
+            })
+            .join(",")}`
+        : "";
+    const qualifier = `${via.length > 0 ? ` via ${via.join(",")}` : ""}${posturePart}`;
     for (const port of match.ports ?? []) out.add(`${port}${qualifier}`);
   }
   return out;
@@ -82,7 +131,16 @@ function accessSet(matches: UserRuleMatch[]): Set<string> {
 async function previewAccess(
   policy: string,
   principal: string,
-): Promise<{ ok: true; access: Set<string> } | { ok: false; error: string; status: number }> {
+): Promise<
+  | {
+      ok: true;
+      access: Set<string>;
+      hasPostureDefs: boolean;
+      matches: UserRuleMatch[];
+      postureDefs: Record<string, string[]> | null | undefined;
+    }
+  | { ok: false; error: string; status: number }
+> {
   const params = new URLSearchParams({ type: "user", previewFor: principal });
   const res = await apiPost(`/tailnet/${getTailnet()}/acl/preview?${params}`, undefined, {
     rawBody: policy,
@@ -96,9 +154,9 @@ async function previewAccess(
   // diagnostic per principal into the payload.
   if (!res.ok) return { ok: false, error: res.error || `HTTP ${res.status}`, status: res.status };
 
-  let parsed: { matches?: UserRuleMatch[] };
+  let parsed: PreviewResponse;
   try {
-    parsed = JSON.parse(res.rawBody ?? "") as { matches?: UserRuleMatch[] };
+    parsed = JSON.parse(res.rawBody ?? "") as PreviewResponse;
   } catch {
     return {
       ok: false,
@@ -116,7 +174,16 @@ async function previewAccess(
       status: res.status,
     };
   }
-  return { ok: true, access: accessSet(parsed.matches) };
+  // The access set is computed by the CALLER, once it knows whether both sides
+  // supplied posture definitions -- that is a cross-request fact this function
+  // cannot see. Raw matches are carried out for exactly that reason.
+  return {
+    ok: true,
+    access: accessSet(parsed.matches, parsed.postures, false),
+    hasPostureDefs: !!parsed.postures,
+    matches: parsed.matches,
+    postureDefs: parsed.postures,
+  };
 }
 
 // First-line marker of the ETag footer tailscale_get_acl appends. The appender
@@ -293,7 +360,7 @@ export const aclTools = [
     name: "tailscale_diff_acl_access",
     description:
       "Answer 'who loses access?' before applying an ACL change. Compares the CURRENT policy against a proposed one and reports, per user, which destinations they gain and lose. Run this before tailscale_update_acl -- validate_acl only checks syntax and the policy's own tests block, so a policy with no tests validates clean while revoking everyone. " +
-      "LIMITS, all reported in the response rather than left to be discovered. It compares USER principals only, so a revocation that runs through a tag or group can show a clean diff; it does not detect a change to a posture DEFINITION, because the comparison keys on posture names; and a narrowed port list shows as a paired loss and gain of the whole entry rather than a clean loss. An empty result is never proof a change is safe. It costs two preview requests per user, so it checks the first 25 by default and stops after 60 seconds regardless; either way it sets `truncated`, reports how many were skipped, and says which limit stopped it. Users whose preview fails are listed in `failed` and excluded from the compared count -- a failure is never reported as lost access, and if nothing could be compared the call fails rather than returning an empty diff.",
+      "LIMITS, all reported in the response rather than left to be discovered. It compares USER principals only, so a revocation that runs through a tag or group can show a clean diff, and an empty result is never proof a change is safe. Posture DEFINITION changes ARE detected: posture names are resolved to their rules, so tightening `posture:corp` shows as a change -- except when a preview omits the definitions map, where it falls back to comparing names. It costs two preview requests per user, so it checks the first 25 by default and stops after 60 seconds regardless; either way it sets `truncated`, reports how many were skipped, and says which limit stopped it. Users whose preview fails are listed in `failed` and excluded from the compared count -- a failure is never reported as lost access, and if nothing could be compared the call fails rather than returning an empty diff.",
     annotations: {
       title: "Diff ACL access",
       readOnlyHint: true,
@@ -307,7 +374,7 @@ export const aclTools = [
         .array(z.string().trim().min(1))
         .optional()
         .describe(
-          "User emails to check. Omit to enumerate the tailnet's users automatically. Pass an explicit list to bound the request count, or to check specific users beyond the cap.",
+          "Principals to check, as they appear in `loginName` from tailscale_list_users. That is often an email, but on a GitHub or SSO tailnet it is not (e.g. 'alice@github') -- pass the loginName verbatim rather than an address you assume. Omit to enumerate the tailnet's users automatically. Pass an explicit list to bound the request count, or to check specific users beyond the cap.",
         ),
       maxPrincipals: z
         .number()
@@ -360,11 +427,14 @@ export const aclTools = [
         if (!usersRes.ok) {
           return { ok: false, error: `could not list users to diff: ${usersRes.error || `HTTP ${usersRes.status}`}` };
         }
-        // `loginName` is the documented login-email field, but the fallbacks are
-        // deliberate: this tool is useless if a field rename empties the
-        // principal list, and an empty list would otherwise read as "nobody is
-        // affected". If none of these resolve, the error below says to pass
-        // `principals` explicitly rather than returning a falsely clean diff.
+        // `loginName` is the principal the preview endpoint expects -- NOT
+        // necessarily an email. Verified against a live tailnet: a GitHub-auth
+        // tailnet returns loginName "alice@github" and carries no `email` key at
+        // all, and preview accepts that value. The fallbacks are still deliberate:
+        // this tool is useless if a field rename empties the principal list, and an
+        // empty list would read as "nobody is affected". If none resolve, the error
+        // below says to pass `principals` explicitly rather than returning a falsely
+        // clean diff.
         const emails = (usersRes.data?.users ?? [])
           .map((u) => u.loginName ?? u.email ?? u.name)
           .filter((v): v is string => typeof v === "string" && v.trim().length > 0);
@@ -436,8 +506,17 @@ export const aclTools = [
           }
           continue;
         }
-        const lost = [...before.access].filter((a) => !after.access.has(a)).sort();
-        const gained = [...after.access].filter((a) => !before.access.has(a)).sort();
+        // Recompute both sides together, because whether posture DEFINITIONS can be
+        // folded into the key is a fact about the PAIR: resolving one side and not
+        // the other would manufacture a change on every posture-gated grant. Only
+        // when both previews carried a postures map is the comparison apples to
+        // apples; otherwise both fall back to names-only, which under-reports a
+        // redefinition rather than inventing one.
+        const definitionsAvailable = before.hasPostureDefs && after.hasPostureDefs;
+        const beforeAccess = accessSet(before.matches, before.postureDefs, definitionsAvailable);
+        const afterAccess = accessSet(after.matches, after.postureDefs, definitionsAvailable);
+        const lost = [...beforeAccess].filter((a) => !afterAccess.has(a)).sort();
+        const gained = [...afterAccess].filter((a) => !beforeAccess.has(a)).sort();
         if (lost.length === 0 && gained.length === 0) unchanged.push(principal);
         else changed.push({ principal, lost, gained });
       }
@@ -506,9 +585,8 @@ export const aclTools = [
           // can come back empty while real access changed.
           scope: [
             "User principals only.",
-            "Not compared: access granted via tags or groups;",
-            "changes to a posture DEFINITION (the diff keys on posture names, so redefining `posture:corp` more strictly leaves every key identical);",
-            "and a destination whose port list is narrowed appears as a paired loss and gain of the whole entry (`tag:prod:22,80` -> `tag:prod:22`) rather than a clean loss, so `gained` is not a literal list of newly-reachable destinations.",
+            "Not compared: access granted via tags or groups.",
+            "Posture definition changes ARE compared -- names are resolved to their rules -- unless a preview omitted the definitions map, in which case names alone are compared and a redefinition would not show.",
             "An empty diff is not proof the change is safe.",
           ].join(" "),
           changed,

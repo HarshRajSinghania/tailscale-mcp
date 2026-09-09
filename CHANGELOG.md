@@ -17,6 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > theory that its absence had degraded that release's notes. Keep entries here
 > current for readers; it will not change what `gh release` shows.
 
+## [Unreleased]
+
+### Fixed
+- **`tailscale_diff_acl_access` now detects a posture DEFINITION change, which it previously reported as "unchanged".** Tightening `posture:corp` from `["node:os == 'macos'"]` to also require a client version changes who can reach every posture-gated destination, but the posture NAME on every match stays byte-identical -- so the diff keyed on names alone and returned a clean result for the whole tailnet at once. That is a silent false-clean on the one tool whose entire value is being believed, and 0.19.0 shipped it as a documented limitation.
+
+  It is fixed rather than documented because a probe against a live tailnet answered the open question: the preview response DOES carry a top-level `postures` map, and it holds the definitions from the policy that was SUBMITTED (previewing a policy with `postures: {"posture:x": ["node:tsVersion >= '1.80'"]}` echoes exactly that back). Posture names are now resolved to their rules, sorted so a reordered definition is not read as a tightening.
+
+  Definitions are folded in only when BOTH previews supplied a map. Resolving one side and not the other would manufacture a change on every posture-gated grant -- an API-shape difference read as a security finding -- so a missing map falls back to comparing names, which under-reports a redefinition rather than inventing one. Adding or removing a posture is still caught either way, because the name itself enters or leaves the key.
+
+- **Removed a documented limitation that does not exist.** 0.19.0 claimed a narrowed port list surfaces as a paired loss and gain of the whole entry (`tag:prod:22,80` -> `tag:prod:22`) rather than a clean loss. The live API disproves it: `ip: ["22", "80", "443"]` returns three SEPARATE port entries, never a comma-joined one, so narrowing a port list already produces a clean loss. The claim told operators the tool was less precise than it is, which is its own kind of wrong.
+
+- **`principals` are `loginName` values, not necessarily emails.** The parameter description said "User emails to check". On a GitHub or SSO tailnet `loginName` is `alice@github` and the user object carries no `email` key at all -- verified against a live tailnet, where preview accepts that value happily. An operator who passed a real email address on such a tailnet would have got zero matches. The resolver already preferred `loginName`, so only the documentation was wrong.
+
+- `UserRuleMatch.postures` is typed `string[] | null`. A live tailnet returns an explicit `null` for a match with no posture requirement, not an absent key. Every read used `?? []` so behaviour was already correct; the type now says what the API actually sends.
+
+### Added
+- Two read-only integration suites (`RUN_INTEGRATION_TESTS=1`) that pin what the probes above established. The preview-shape suite submits a CRAFTED policy rather than the tailnet's own, so its answers do not depend on how the target tailnet is configured, and it fails loudly if the `postures` map disappears -- the day that happens, posture-redefinition detection silently degrades to name comparison. The result-size suite measures each capped tool's live response, asserts it fits inside the declared cap, and prints the sizes.
+
+  Sizing `maxResultSizeChars` below the documented 500000 ceiling REMAINS OPEN, and the blocker is now precise: it needs a POPULATED tailnet. Measured against an empty one, `tailscale_list_devices` returns 14 characters, which cannot inform a cap. The suite is the instrument; someone still has to point it at a real tailnet.
+
 ## [0.19.0] — 2026-09-09
 
 ### Added
