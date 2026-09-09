@@ -7,6 +7,22 @@ import { apiGet, apiPost, getTailnet } from "../api.js";
 // to matter under TAILSCALE_MAX_CONCURRENT and the per-request budget.
 const DEFAULT_PRINCIPAL_CAP = 25;
 
+// Wall-clock ceiling for one tailscale_diff_acl_access call, across ALL of its
+// requests.
+//
+// api.ts's own budget (TAILSCALE_REQUEST_BUDGET_MS, default 90s) is read fresh
+// per apiRequest, which is the right shape for a one-request tool and no
+// protection at all for this one: at the default cap it issues ~52 requests, so
+// nothing bounded the call as a whole. The comment on that constant explains
+// why that matters -- "MCP clients usually have their own outer timeout in the
+// 60-120s range" -- and a tool that runs past it hands the client a timeout
+// instead of the partial answer it already has in hand.
+//
+// 60s sits under the low end of that range. Deliberately NOT a new env var: it
+// would need a sandbox --allow-env grant and a README entry to be real, and the
+// useful knob for "check fewer users" already exists as maxPrincipals.
+const DIFF_TIME_BUDGET_MS = 60_000;
+
 /** One rule match as the preview endpoint returns it (Go: UserRuleMatch). */
 interface UserRuleMatch {
   users?: string[];
@@ -277,7 +293,7 @@ export const aclTools = [
     name: "tailscale_diff_acl_access",
     description:
       "Answer 'who loses access?' before applying an ACL change. Compares the CURRENT policy against a proposed one and reports, per user, which destinations they gain and lose. Run this before tailscale_update_acl -- validate_acl only checks syntax and the policy's own tests block, so a policy with no tests validates clean while revoking everyone. " +
-      "LIMITS, all reported in the response rather than left to be discovered. It compares USER principals only, so a revocation that runs through a tag or group can show a clean diff; it does not detect a change to a posture DEFINITION, because the comparison keys on posture names; and a narrowed port list shows as a paired loss and gain of the whole entry rather than a clean loss. An empty result is never proof a change is safe. It costs two preview requests per user, so it checks the first 25 by default and sets `truncated` with the counts. Users whose preview fails are listed in `failed` and excluded from the compared count -- a failure is never reported as lost access, and if nothing could be compared the call fails rather than returning an empty diff.",
+      "LIMITS, all reported in the response rather than left to be discovered. It compares USER principals only, so a revocation that runs through a tag or group can show a clean diff; it does not detect a change to a posture DEFINITION, because the comparison keys on posture names; and a narrowed port list shows as a paired loss and gain of the whole entry rather than a clean loss. An empty result is never proof a change is safe. It costs two preview requests per user, so it checks the first 25 by default and stops after 60 seconds regardless; either way it sets `truncated`, reports how many were skipped, and says which limit stopped it. Users whose preview fails are listed in `failed` and excluded from the compared count -- a failure is never reported as lost access, and if nothing could be compared the call fails rather than returning an empty diff.",
     annotations: {
       title: "Diff ACL access",
       readOnlyHint: true,
@@ -303,6 +319,10 @@ export const aclTools = [
         ),
     }),
     handler: async (input: { policy: string; principals?: string[]; maxPrincipals?: number }) => {
+      // Clock starts before the two setup GETs, not at the principal loop: they
+      // are part of the same call, and a slow pair of them is exactly when the
+      // remaining budget matters most.
+      const startedAt = Date.now();
       // Baseline is fetched directly rather than through tailscale_get_acl so it
       // arrives without that tool's appended ETag footer. (Comments are inert to
       // the preview endpoint either way, but the baseline should be the policy
@@ -321,8 +341,19 @@ export const aclTools = [
 
       let principals: string[];
       let availableTotal: number;
-      if (input.principals && input.principals.length > 0) {
+      if (input.principals !== undefined) {
         principals = [...new Set(input.principals)];
+        // An explicitly-passed empty array used to fall through to the
+        // auto-enumeration branch, so a caller asking for zero principals got a
+        // scan of the entire tailnet and up to 50 requests instead. Naming the
+        // contradiction beats silently doing the opposite of what was asked.
+        if (principals.length === 0) {
+          return {
+            ok: false,
+            error:
+              "`principals` was passed as an empty list, so no users were named to compare. Omit the argument entirely to enumerate the tailnet's users, or name at least one email.",
+          };
+        }
         availableTotal = principals.length;
       } else {
         const usersRes = await apiGet<{ users?: Array<Record<string, unknown>> }>(`/tailnet/${getTailnet()}/users`);
@@ -360,7 +391,19 @@ export const aclTools = [
       // cap) against a tailnet whose TAILSCALE_MAX_CONCURRENT is unset by
       // default -- a read-only diagnostic should not be the thing that trips
       // rate limiting on a tailnet its caller is about to reconfigure.
+      // Counted rather than derived from `checked.length`: an early stop leaves
+      // principals in `checked` that were never touched, and using the planned
+      // length as the denominator would count them as successfully compared --
+      // reintroducing, in a new place, the exact overstatement the compared/
+      // attempted split exists to prevent.
+      let attempted = 0;
+      let stoppedOnTime = false;
       for (const principal of checked) {
+        if (Date.now() - startedAt > DIFF_TIME_BUDGET_MS) {
+          stoppedOnTime = true;
+          break;
+        }
+        attempted++;
         const [before, after] = await Promise.all([
           previewAccess(baselinePolicy, principal),
           previewAccess(input.policy, principal),
@@ -405,28 +448,38 @@ export const aclTools = [
       // likely to quote -- while asserting coverage of users the tool never
       // compared. The tool's own description promised failures were excluded
       // from the counts; this is what makes that true.
-      const compared = checked.length - failed.length;
+      const compared = attempted - failed.length;
       // Comparing nobody is not a clean diff. Every other zero-information
       // outcome here is already a hard error (unreadable ACL, unresolvable
       // emails); this is the same shape and the most reassuring-looking one.
-      if (compared === 0 && checked.length > 0) {
+      // Covers the time-budget case too: if the setup GETs alone burned the
+      // budget, `attempted` is 0 and there is nothing to report.
+      if (compared === 0) {
         return {
           ok: false,
-          error: `no users could be compared: all ${checked.length} preview attempts failed. First failure: ${failed[0]?.error ?? "unknown"}`,
+          error: stoppedOnTime
+            ? `no users could be compared: the ${DIFF_TIME_BUDGET_MS / 1000}s budget for this call was spent before any comparison finished. Narrow the run with \`principals\`, or lower \`maxPrincipals\`.`
+            : `no users could be compared: all ${attempted} preview attempts failed. First failure: ${failed[0]?.error ?? "unknown"}`,
         };
       }
 
       const losing = changed.filter((c) => c.lost.length > 0).length;
       const gaining = changed.filter((c) => c.gained.length > 0).length;
-      const truncated = principals.length > checked.length;
+      const notChecked = principals.length - attempted;
+      const truncated = notChecked > 0;
       const summary = [
         // Failures lead when present, so the headline cannot read as an
         // all-clear over a partially-compared run.
-        failed.length > 0 ? `${failed.length} of ${checked.length} users could not be checked` : null,
+        failed.length > 0 ? `${failed.length} of ${attempted} users could not be checked` : null,
         `${losing} of ${compared} users compared lose access`,
         `${gaining} gain access`,
         `${unchanged.length} unchanged`,
-        truncated ? `${principals.length - checked.length} not checked (cap ${cap})` : null,
+        // Names WHICH limit stopped the run: "cap 25" tells the caller to raise
+        // maxPrincipals, and the time budget tells them the opposite -- that
+        // raising it would make things worse, and the run needs narrowing.
+        truncated
+          ? `${notChecked} not checked (${stoppedOnTime ? `${DIFF_TIME_BUDGET_MS / 1000}s time budget` : `cap ${cap}`})`
+          : null,
       ]
         .filter(Boolean)
         .join(", ");
@@ -442,6 +495,11 @@ export const aclTools = [
           principalsFailed: failed.length,
           principalsAvailable: availableTotal,
           truncated,
+          // Distinguishes the two truncation causes for a machine reader, which
+          // the summary string does only in prose. They call for opposite
+          // responses: a cap stop means raise maxPrincipals, a time stop means
+          // narrow the run.
+          stoppedOnTimeBudget: stoppedOnTime,
           // Restated in the payload, not just the tool description: whoever
           // reads this output is deciding whether to apply the change, and may
           // never have read the description. Each clause names a way this diff
