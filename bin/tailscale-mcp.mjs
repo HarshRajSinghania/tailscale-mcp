@@ -196,6 +196,7 @@ function sandboxFlags() {
     "TAILSCALE_RETRY_BASE_DELAY_MS",
     "TAILSCALE_TAILNET",
     "TAILSCALE_TOOLS",
+    "TAILSCALE_WRITE_GROUPS",
   ];
 
   const flags = ["--permission", netFlag, `--allow-env=${env.join(",")}`];

@@ -5,6 +5,9 @@
  * - TAILSCALE_TOOLS="devices,acl,dns"              → include only tools from those groups.
  *                                                    Overrides TAILSCALE_PROFILE when both are set.
  * - TAILSCALE_READONLY="1" | "true"                → include only tools with readOnlyHint: true.
+ * - TAILSCALE_WRITE_GROUPS="devices,keys"         → writes are served ONLY in those groups; every
+ *                                                    other loaded group is served read-only.
+ *                                                    Unset = no write gate (today's behaviour).
  * - Filters combine as intersection.
  * - No env vars                                    → all tools. Backward compatible.
  */
@@ -15,6 +18,7 @@ export interface FilterOptions {
   tools?: string | undefined;
   readonly?: string | undefined;
   profile?: string | undefined;
+  writeGroups?: string | undefined;
 }
 
 export interface FilterResult<T> {
@@ -52,6 +56,25 @@ export interface FilterResult<T> {
   // than yielding a zero-tool server. Lets the banner / startup warning report
   // the fallback. `unknownGroups` still names the offending entries.
   toolsAllUnknown?: boolean;
+  // The write grant that ACTUALLY applied, after dropping unregistered names and
+  // intersecting with the loaded set. An empty array means "configured, granted
+  // nothing" (every write withheld); ABSENT means the knob was never set, which is
+  // the no-gate default. Those two states render differently in the banner and must
+  // not be conflated -- `write=none` is a deliberate lockdown, no `write=` segment
+  // at all is today's unrestricted behaviour.
+  writeGroups?: string[];
+  // Names in TAILSCALE_WRITE_GROUPS that are not registered groups -- a typo.
+  // Operator-fixable, and reported separately from `writeGroupsNotLoaded` because the
+  // two have different fixes: this one means "you misspelled it", that one means
+  // "spelled right, but your load filter excluded it".
+  unknownWriteGroups?: string[];
+  // Registered groups the operator granted writes to that their TAILSCALE_TOOLS /
+  // TAILSCALE_PROFILE filter never loaded. The grant is a silent no-op without this.
+  writeGroupsNotLoaded?: string[];
+  // True iff TAILSCALE_READONLY won over a non-empty write grant. Reported so the
+  // banner can say WHICH knob produced the lockdown; without it an operator who set
+  // both sees no writes and cannot tell which one to change.
+  writeGroupsOverriddenByReadonly?: boolean;
 }
 
 export const PROFILES: Record<string, readonly string[]> = {
@@ -70,6 +93,28 @@ export const PROFILES: Record<string, readonly string[]> = {
  * Case-sensitive on purpose: matches TAILSCALE_LOCAL_CLI's exact-string
  * contract, so an operator who sets both follows the same rule.
  */
+/**
+ * Parse a comma-separated group list (TAILSCALE_TOOLS, TAILSCALE_WRITE_GROUPS).
+ *
+ * Returns null for unset, empty, whitespace-only and commas-only, all of which mean
+ * "the operator did not configure this knob". That is deliberate and load-bearing for
+ * TAILSCALE_WRITE_GROUPS in particular: `-e TAILSCALE_WRITE_GROUPS` in docker, or an
+ * unexpanded `${VAR}` in a shell wrapper, both produce the empty string, and treating
+ * that as "revoke every write" would turn a config typo into a silent outage on upgrade.
+ *
+ * Case-SENSITIVE, matching the registry keys exactly. Both knobs name the same groups,
+ * so folding case in one and not the other would make `Devices` mean different things
+ * in two adjacent variables.
+ */
+export function parseGroupList(value: string | undefined): string[] | null {
+  if (!value) return null;
+  const parsed = value
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return parsed.length > 0 ? parsed : null;
+}
+
 export function parseReadonlyFlag(value: string | undefined): boolean {
   return value === "1" || value === "true";
 }
@@ -102,15 +147,12 @@ export function filterTools<T extends Annotated>(
     }
   }
 
-  const parsedTools = options.tools
-    ? options.tools
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean)
-    : null;
-  // Treat all-whitespace / comma-only inputs as "no filter" rather than "zero tools",
+  // Treat all-whitespace / comma-only inputs as "not set" rather than "zero groups",
   // so a misconfigured TAILSCALE_TOOLS=" " doesn't silently yield an empty server.
-  const explicitTools = parsedTools && parsedTools.length > 0 ? parsedTools : null;
+  // Shared with TAILSCALE_WRITE_GROUPS below rather than duplicated: the two knobs
+  // speak the same vocabulary, and an operator who learns one parse rule should not
+  // discover the other spells it differently.
+  const explicitTools = parseGroupList(options.tools);
 
   // If TAILSCALE_TOOLS was set but EVERY name is unknown (e.g. a typo'd
   // "devises"), using it as the group filter would yield a zero-tool server.
@@ -141,11 +183,31 @@ export function filterTools<T extends Annotated>(
 
   const readonly = parseReadonlyFlag(options.readonly);
 
+  // Write scope. NOTE the deliberate inversion of the all-unknown fallback that
+  // TAILSCALE_TOOLS gets above: a typo'd LOAD filter falls back to loading more, whose
+  // worst case is a chatty server, while a typo'd WRITE grant that fell back the same
+  // way would hand an agent all 56 writes at the moment its operator was restricting
+  // it -- fail-open, triggered by the input a careless operator is most likely to
+  // produce. So there is no fallback here: anything this gate does not positively
+  // recognise is not writable. Same direction as `readOnlyHint !== true` below.
+  // The degraded state is also survivable rather than an outage: every read tool still
+  // registers, so the agent can still explain the problem.
+  const requestedWriteGroups = parseGroupList(options.writeGroups);
+  const unknownWriteGroups = requestedWriteGroups ? requestedWriteGroups.filter((g) => !validNames.has(g)) : [];
+  // null = knob unset = no gate. A Set (possibly empty) = configured.
+  const writeScope = requestedWriteGroups ? new Set(requestedWriteGroups.filter((g) => validNames.has(g))) : null;
+
   const out: T[] = [];
   for (const [name, tools] of Object.entries(groups)) {
     if (enabledGroups && !enabledGroups.has(name)) continue;
+    // ONE write predicate for both knobs, so readonly is simply the strongest input to
+    // the same question rather than a second code path that could drift from it.
+    const writesAllowed = !readonly && (writeScope === null || writeScope.has(name));
     for (const t of tools) {
-      if (readonly && t.annotations.readOnlyHint !== true) continue;
+      // `!== true`, not `=== false`: a tool that forgot its annotation is treated as a
+      // write and withheld unless its group was granted. Adding the write gate here
+      // rather than beside it means that fail-closed guard now covers both knobs.
+      if (t.annotations.readOnlyHint !== true && !writesAllowed) continue;
       out.push(t);
     }
   }
@@ -160,5 +222,24 @@ export function filterTools<T extends Annotated>(
   if (effectiveExplicitTools) result.explicitTools = effectiveExplicitTools;
   if (profileWouldFilter) result.profileWouldFilter = true;
   if (explicitToolsAllUnknown) result.toolsAllUnknown = true;
+  // Write-gate provenance is resolved HERE and returned, never re-derived by the
+  // banner. filter.ts already carries one bug of that shape in its history -- the
+  // unknownGroups / unknownProfileGroups split above exists because a warning blamed
+  // TAILSCALE_TOOLS for a name the operator had never typed. One resolver, one truth.
+  if (writeScope) {
+    const loaded = [...writeScope].filter((g) => !enabledGroups || enabledGroups.has(g));
+    result.writeGroups = readonly ? [] : loaded.sort();
+    // Only flag the override when a grant was actually overridden: READONLY=1 with an
+    // all-typo grant already yields nothing, and blaming readonly there would point the
+    // operator at the wrong knob.
+    const overridden = readonly && writeScope.size > 0;
+    if (overridden) result.writeGroupsOverriddenByReadonly = true;
+    // Exactly ONE cause is reported. Under readonly the grant was void before the load
+    // filter could matter, so also saying "you named an unloaded group" would hand the
+    // operator two fixes for a config where neither name is the operative problem.
+    const notLoaded = overridden ? [] : [...writeScope].filter((g) => enabledGroups && !enabledGroups.has(g));
+    if (notLoaded.length > 0) result.writeGroupsNotLoaded = notLoaded.sort();
+  }
+  if (unknownWriteGroups.length > 0) result.unknownWriteGroups = unknownWriteGroups;
   return result;
 }

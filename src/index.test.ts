@@ -278,6 +278,76 @@ async function conductMcpSession(extraEnv: Record<string, string>): Promise<McpS
   }
 }
 
+/**
+ * Conduct a session and call one tool, returning its decoded payload.
+ *
+ * Separate from conductMcpSession because that one is shaped around list results.
+ * Both hand-roll the framing for the same reason: the stdio transport is
+ * newline-delimited JSON with no Content-Length headers, and asserting against raw
+ * frames keeps these tests independent of the SDK client's own behaviour.
+ *
+ * The payload is double-decoded on purpose -- wrapToolHandler serialises the tool's
+ * `data` into a text content block, so what an agent actually reads is the JSON
+ * inside that string, not the JSON-RPC result bag around it.
+ */
+async function callMcpTool(
+  extraEnv: Record<string, string>,
+  toolName: string,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const NL = "\n";
+  const child = spawn(process.execPath, [serverEntry], {
+    env: { PATH: process.env.PATH ?? "", ...extraEnv },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  try {
+    return await new Promise<Record<string, unknown>>((resolvePromise, reject) => {
+      let buffered = "";
+      const deadline = setTimeout(() => reject(new Error(`no tools/call response within 15s for ${toolName}`)), 15_000);
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        buffered += chunk;
+        for (let nl = buffered.indexOf(NL); nl >= 0; nl = buffered.indexOf(NL)) {
+          const line = buffered.slice(0, nl).trim();
+          buffered = buffered.slice(nl + 1);
+          if (!line) continue;
+          const msg = JSON.parse(line) as JsonRpcResponse;
+          if (msg.id === 1) {
+            child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + NL);
+            child.stdin.write(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                method: "tools/call",
+                params: { name: toolName, arguments: args },
+              }) + NL,
+            );
+          }
+          if (msg.id === 2) {
+            clearTimeout(deadline);
+            const result = msg.result as { content?: Array<{ text?: string }>; isError?: boolean } | undefined;
+            assert.ok(!result?.isError, `${toolName} returned an error: ${result?.content?.[0]?.text}`);
+            const text = result?.content?.[0]?.text;
+            assert.equal(typeof text, "string", `${toolName} returned no text content`);
+            resolvePromise(JSON.parse(text as string) as Record<string, unknown>);
+          }
+        }
+      });
+      child.stdin.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } },
+        }) + NL,
+      );
+    });
+  } finally {
+    child.stdin.end();
+    child.kill();
+  }
+}
+
 const API_KEY = { TAILSCALE_API_KEY: "tskey-api-startup-test" };
 
 describe("server startup banner", () => {
@@ -481,10 +551,15 @@ describe("MCP protocol surface", () => {
     // can, and it also pins that the name argument stayed in first position of
     // index.ts's server.registerTool(name, config, handler) call, which nothing
     // else in the repo reads.
+    // The catalog tool is registered OUTSIDE buildToolGroups on purpose -- it is not a
+    // Tailscale API tool, and every count in the README and release-metadata.test.ts
+    // derives from that registry, so admitting it there would make "97 admin-API
+    // tools" false. It must therefore appear in tools/list and NOT in the registry,
+    // which is exactly what this asserts.
     assert.deepEqual(
       session.tools.map((t) => t.name).sort(),
-      registryToolNames({}),
-      "tools/list disagrees with the tool registry",
+      [...registryToolNames({}), "tailscale_tool_groups"].sort(),
+      "tools/list disagrees with the tool registry plus the always-on catalog",
     );
   });
 });
@@ -557,5 +632,221 @@ describe("tool _meta over a live session", () => {
 
     const listDevices = session.tools.find((t) => t.name === "tailscale_list_devices");
     assert.equal(listDevices?.title, "List devices", "title must come from the tool's own annotations");
+  });
+});
+
+describe("TAILSCALE_WRITE_GROUPS wiring", () => {
+  // These spawn the BUNDLE. filter.ts can resolve the grant perfectly while index.ts
+  // forgets to pass writeGroups into formatBannerFilterSuffix -- the two banner fields
+  // are optional precisely so fourteen existing call sites did not need mechanical
+  // edits, and this is what pays for that choice.
+
+  it("reports the grant in the banner and withholds writes outside it", async () => {
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "devices,keys" });
+    assert.match(stderr, /write=devices,keys/);
+    assert.ok(
+      toolCount(stderr) < toolCount(await captureStartup({ ...API_KEY })),
+      "a grant must withhold the writes outside it",
+    );
+  });
+
+  it("grants nothing on a typo and names it, rather than falling back like TAILSCALE_TOOLS", async () => {
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "devises" });
+    assert.match(stderr, /TAILSCALE_WRITE_GROUPS includes unknown group\(s\): devises/);
+    assert.match(stderr, /write=none/);
+    // The load filter's all-unknown fallback must NOT have leaked into the write gate.
+    assert.equal(
+      toolCount(stderr),
+      toolCount(await captureStartup({ ...API_KEY, TAILSCALE_READONLY: "1" })),
+      "an all-unknown grant must serve exactly the read-only surface",
+    );
+  });
+
+  it("points a sentinel guess at the spelling that does what it meant", async () => {
+    const all = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "all" });
+    assert.match(all, /"all" is not a group name -- leave TAILSCALE_WRITE_GROUPS unset/);
+    const none = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "none" });
+    assert.match(none, /TAILSCALE_READONLY=1 is the shipped spelling/);
+  });
+
+  it("warns when a grant names a group the load filter never loaded", async () => {
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_TOOLS: "acl", TAILSCALE_WRITE_GROUPS: "dns" });
+    assert.match(stderr, /does not load: dns\. Those grants had no effect/);
+    // Distinct from the typo warning: the name is spelled correctly.
+    assert.ok(!/includes unknown group/.test(stderr), "a loaded-filter mismatch is not a typo");
+  });
+
+  it("names readonly as the cause when it overrides a grant", async () => {
+    const stderr = await captureStartup({
+      ...API_KEY,
+      TAILSCALE_READONLY: "1",
+      TAILSCALE_WRITE_GROUPS: "devices",
+    });
+    assert.match(stderr, /readonly \(TAILSCALE_WRITE_GROUPS ignored\)/);
+  });
+
+  it("warns that writing keys, users or acl is admin-equivalent", async () => {
+    // The single most important line this feature prints: the knob filters the tool
+    // list, not the credential, and these three areas are tailnet-admin-equivalent.
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "keys" });
+    assert.match(stderr, /can write to keys, which is tailnet-admin-equivalent/);
+    assert.match(stderr, /Scope the Tailscale OAuth client itself/);
+    // Silent when the grant excludes all three, so it does not become noise.
+    const quiet = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "devices" });
+    assert.ok(!/admin-equivalent/.test(quiet), "must not fire on a non-admin grant");
+  });
+
+  it("warns on the UNGATED default too, where all three are writable", async () => {
+    // The warning is derived from what actually registered, not from the grant. An
+    // earlier revision read `writeGroups` and so inverted the signal relative to the
+    // risk: it fired on a NARROWED grant and stayed silent on the default, where keys
+    // AND users AND acl are all writable. The operator in the more permissive state
+    // heard less.
+    const stderr = await captureStartup({ ...API_KEY });
+    assert.match(stderr, /can write to keys, users, acl, which is tailnet-admin-equivalent/);
+  });
+
+  it("stays quiet about admin equivalence with no credentials, and under readonly", async () => {
+    // No creds: a fresh install has a more useful first message to read (the auth
+    // error on the first tool call), same gate as the profile tip.
+    const noCreds = await captureStartup({ TAILSCALE_WRITE_GROUPS: "keys" });
+    assert.ok(!/admin-equivalent/.test(noCreds), "a fresh install must not get a security lecture first");
+    // Readonly: nothing is writable, so there is nothing to warn about.
+    const ro = await captureStartup({ ...API_KEY, TAILSCALE_READONLY: "1" });
+    assert.ok(!/admin-equivalent/.test(ro), "readonly writes nothing");
+  });
+
+  it("distinguishes a group that exists but is not enabled from a typo", async () => {
+    // local-cli is a real group that only registers under TAILSCALE_LOCAL_CLI=1.
+    // Reporting it as "unknown" alongside a list of valid groups that excludes it
+    // sends the operator hunting a misspelling that does not exist -- the same
+    // misattribution the unknownGroups / unknownProfileGroups split exists to prevent.
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "local-cli" });
+    assert.match(stderr, /exist but are not enabled in this process: local-cli/);
+    assert.match(stderr, /Set TAILSCALE_LOCAL_CLI=1/);
+    assert.ok(!/includes unknown group/.test(stderr), "a real group name is not a typo");
+  });
+
+  it("reports a real typo and a not-enabled group as separate causes in one run", async () => {
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "local-cli,devises" });
+    assert.match(stderr, /not enabled in this process: local-cli/);
+    assert.match(stderr, /includes unknown group\(s\): devises/);
+    // The typo warning must name ONLY the typo -- listing local-cli there would
+    // contradict the line printed immediately above it.
+    assert.ok(!/unknown group\(s\): local-cli/.test(stderr), "the two causes must not overlap");
+  });
+
+  it("names exactly one cause when readonly voids a grant that also named an unloaded group", async () => {
+    // Readonly voided the grant before the load filter could matter, so also saying
+    // "you named an unloaded group" hands the operator two fixes for a config where
+    // neither name is the operative problem.
+    const stderr = await captureStartup({
+      ...API_KEY,
+      TAILSCALE_READONLY: "1",
+      TAILSCALE_TOOLS: "acl",
+      TAILSCALE_WRITE_GROUPS: "dns",
+    });
+    assert.match(stderr, /readonly \(TAILSCALE_WRITE_GROUPS ignored\)/);
+    assert.ok(!/had no effect/.test(stderr), "readonly is the single operative cause");
+  });
+
+  it("changes nothing when unset", async () => {
+    const stderr = await captureStartup({ ...API_KEY });
+    assert.ok(!/write=/.test(stderr), "no gate configured means no write= segment");
+  });
+
+  it("stays quiet about admin equivalence when the load filter excluded those groups", async () => {
+    // The warning derives from what REGISTERED, so the load filter is a third distinct
+    // way it can fall silent -- the other two (readonly, a non-admin grant) are covered
+    // and this one was not. TAILSCALE_TOOLS=devices never loads keys/users/acl, so
+    // there is nothing admin-equivalent to warn about even with no write gate at all.
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_TOOLS: "devices" });
+    assert.ok(!/admin-equivalent/.test(stderr), "an unloaded group cannot be written to");
+    assert.ok(!/write=/.test(stderr), "no write gate was configured");
+  });
+
+  it("reports a sentinel and a real typo together, hinting once", async () => {
+    // What a confused operator actually types. The hint is selected by a .some() over
+    // the filtered list, so a mixed input exercises a path neither pure case does.
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "all,devises" });
+    assert.match(stderr, /unknown group\(s\): all, devises/);
+    assert.match(stderr, /"all" is not a group name/);
+    assert.ok(!/TAILSCALE_READONLY=1 is the shipped spelling/.test(stderr), "one hint, not both");
+  });
+
+  it("treats a granted local-cli as a silent no-op once the opt-in is on", async () => {
+    // Mirror of the not-enabled warning: same name, and the only difference is whether
+    // the opt-in registered the group.
+    const stderr = await captureStartup({
+      ...API_KEY,
+      TAILSCALE_LOCAL_CLI: "1",
+      TAILSCALE_WRITE_GROUPS: "local-cli",
+    });
+    assert.match(stderr, /write=local-cli/);
+    assert.ok(!/not enabled in this process/.test(stderr), "it IS enabled here");
+    assert.ok(!/includes unknown group/.test(stderr), "and it is not a typo");
+  });
+});
+
+describe("the always-on catalog tool", () => {
+  // The exemption is the whole feature. A catalog that any filter can withhold is
+  // useless precisely when it is needed -- the more restricted the server, the more
+  // an agent needs to be told why.
+  it("survives every filter combination, including ones that withhold everything else", async () => {
+    const hostile: Array<[string, Record<string, string>]> = [
+      ["readonly", { TAILSCALE_READONLY: "1" }],
+      ["minimal profile", { TAILSCALE_PROFILE: "minimal" }],
+      ["single group", { TAILSCALE_TOOLS: "audit" }],
+      ["all-unknown tools", { TAILSCALE_TOOLS: "nonsense" }],
+      ["no writes granted", { TAILSCALE_WRITE_GROUPS: "devises" }],
+      [
+        "everything at once",
+        {
+          TAILSCALE_PROFILE: "minimal",
+          TAILSCALE_TOOLS: "audit",
+          TAILSCALE_READONLY: "1",
+          TAILSCALE_WRITE_GROUPS: "devises",
+        },
+      ],
+    ];
+    for (const [label, env] of hostile) {
+      const session = await conductMcpSession({ ...API_KEY, ...env });
+      const names = session.tools.map((t) => t.name);
+      assert.ok(names.includes("tailscale_tool_groups"), `the catalog must survive: ${label}`);
+    }
+  });
+
+  it("is callable and explains a withheld tool over a real session", async () => {
+    // End to end through the protocol, against the spawned BUNDLE: the unit tests
+    // exercise the pure functions, and this is what proves the wiring in index.ts
+    // passes the right state rather than a plausible-looking empty one.
+    const res = await callMcpTool({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "dns" }, "tailscale_tool_groups", {
+      toolName: "tailscale_delete_device",
+    });
+    assert.equal(res.available, false);
+    assert.equal(res.group, "devices");
+    assert.match(String(res.toEnable), /add "devices" to TAILSCALE_WRITE_GROUPS/);
+  });
+
+  it("distinguishes a nonexistent tool from a withheld one, end to end", async () => {
+    const res = await callMcpTool({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "dns" }, "tailscale_tool_groups", {
+      toolName: "tailscale_reboot_device",
+    });
+    assert.equal(res.available, false);
+    assert.equal(res.group, undefined, "no group -- it exists nowhere");
+    assert.match(String(res.reason), /no tool by that name exists/);
+    assert.equal(res.toEnable, undefined, "no env change can produce it");
+  });
+
+  it("reports the real registry's groups with per-group remedies", async () => {
+    const res = await callMcpTool({ ...API_KEY, TAILSCALE_PROFILE: "minimal" }, "tailscale_tool_groups", {});
+    const groups = res.groups as Array<{ group: string; status: string; toEnable?: string }>;
+    const acl = groups.find((g) => g.group === "acl");
+    assert.equal(acl?.status, "unavailable");
+    assert.match(String(acl?.toEnable), /TAILSCALE_PROFILE=full/);
+    // local-cli is off for a different reason and must say so rather than blaming
+    // the profile the operator did set.
+    const localCli = groups.find((g) => g.group === "local-cli");
+    assert.equal(localCli?.toEnable, "set TAILSCALE_LOCAL_CLI=1");
   });
 });

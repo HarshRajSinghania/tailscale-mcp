@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { PROFILES } from "./filter.js";
+import { filterTools, PROFILES } from "./filter.js";
 import {
   buildToolGroups,
   buildToolMeta,
@@ -912,5 +912,214 @@ describe("buildToolMeta", () => {
     const b = buildToolMeta("tailscale_list_devices", { requireApproval: true });
     assert.notEqual(a, b, "must not hand out the same object twice");
     assert.deepEqual(a, b);
+  });
+});
+
+describe("the write surface each TAILSCALE_WRITE_GROUPS grant hands over", () => {
+  it("matches this pinned literal, per group", () => {
+    // A NAME LITERAL, not derived from the annotations. Deriving it would make the
+    // test agree with whatever the annotations happen to say, which is the drift it
+    // exists to catch -- and the annotations are demonstrably not a security
+    // predicate (update_user_role is destructiveHint:false and its role enum includes
+    // "owner"; authorize_device is false while deauthorize_device is true).
+    //
+    // WHY THIS TEST IS THE CONTROL: a group grant is a STANDING grant over the group's
+    // FUTURE contents. Adding a write tool to devices.ts widens every deployment that
+    // already set TAILSCALE_WRITE_GROUPS=devices, with no operator action and no
+    // upgrade prompt. This converts that into one reviewed diff line. The cost -- a
+    // line per new write tool -- IS the control; do not replace it with a count.
+    const groups = buildToolGroups({ TAILSCALE_LOCAL_CLI: "1" });
+    const writesByGroup: Record<string, string[]> = {};
+    for (const [name, tools] of Object.entries(groups)) {
+      const writes = tools
+        .filter((t) => t.annotations.readOnlyHint !== true)
+        .map((t) => t.name)
+        .sort();
+      if (writes.length > 0) writesByGroup[name] = writes;
+    }
+
+    assert.deepEqual(
+      writesByGroup,
+      {
+        acl: ["tailscale_update_acl"],
+        devices: [
+          "tailscale_authorize_device",
+          "tailscale_batch_update_posture_attributes",
+          "tailscale_deauthorize_device",
+          "tailscale_delete_device",
+          "tailscale_delete_device_posture_attribute",
+          "tailscale_expire_device",
+          "tailscale_rename_device",
+          "tailscale_set_device_ip",
+          "tailscale_set_device_posture_attribute",
+          "tailscale_set_device_routes",
+          "tailscale_set_device_tags",
+          "tailscale_set_devices_authorized",
+          "tailscale_update_device_key",
+        ],
+        dns: [
+          "tailscale_set_dns_configuration",
+          "tailscale_set_dns_preferences",
+          "tailscale_set_nameservers",
+          "tailscale_set_search_paths",
+          "tailscale_set_split_dns",
+          "tailscale_update_split_dns",
+        ],
+        invites: [
+          "tailscale_accept_device_invite",
+          "tailscale_create_device_invite",
+          "tailscale_create_user_invite",
+          "tailscale_delete_device_invite",
+          "tailscale_delete_user_invite",
+          "tailscale_resend_device_invite",
+          "tailscale_resend_user_invite",
+        ],
+        keys: [
+          "tailscale_create_key",
+          "tailscale_create_oauth_app",
+          "tailscale_delete_key",
+          "tailscale_delete_oauth_app",
+          "tailscale_update_key",
+        ],
+        "log-streaming": [
+          "tailscale_create_aws_external_id",
+          "tailscale_delete_log_stream_config",
+          "tailscale_set_log_stream_config",
+        ],
+        "org-tailnets": ["tailscale_create_org_tailnet", "tailscale_delete_tailnet"],
+        posture: [
+          "tailscale_create_posture_integration",
+          "tailscale_delete_posture_integration",
+          "tailscale_update_posture_integration",
+        ],
+        services: ["tailscale_delete_service", "tailscale_set_service_device_approval", "tailscale_update_service"],
+        tailnet: [
+          "tailscale_resend_contact_verification",
+          "tailscale_set_contacts",
+          "tailscale_update_tailnet_settings",
+        ],
+        users: [
+          "tailscale_approve_user",
+          "tailscale_delete_user",
+          "tailscale_restore_user",
+          "tailscale_suspend_user",
+          "tailscale_update_user_role",
+        ],
+        webhooks: [
+          "tailscale_create_webhook",
+          "tailscale_delete_webhook",
+          "tailscale_rotate_webhook_secret",
+          "tailscale_test_webhook",
+          "tailscale_update_webhook",
+        ],
+      },
+      "the write surface a grant hands an agent changed -- adding a write tool to a group widens every deployment that already granted it",
+    );
+  });
+
+  it("leaves the opt-in local-cli group with no writes, so it needs no grant", () => {
+    const groups = buildToolGroups({ TAILSCALE_LOCAL_CLI: "1" });
+    const localCliWrites = (groups["local-cli"] ?? []).filter((t) => t.annotations.readOnlyHint !== true);
+    assert.deepEqual(
+      localCliWrites,
+      [],
+      "all six local-CLI diagnostics are reads; a write here would need a tier decision",
+    );
+  });
+
+  it("names every admin-equivalent group in the registry", () => {
+    // index.ts warns when a grant includes keys, users or acl. If a future group
+    // becomes admin-equivalent, this is where that gets noticed: the three named
+    // here are the ones whose writes mint credentials, promote to owner, or rewrite
+    // policy for every principal.
+    const groups = buildToolGroups({});
+    for (const name of ["keys", "users", "acl"]) {
+      assert.ok(groups[name], `${name} must exist for the admin-equivalence warning to fire`);
+    }
+  });
+});
+
+describe("formatBannerFilterSuffix write-gate rendering", () => {
+  const base = {
+    unknownProfile: undefined,
+    explicitTools: undefined,
+    profileWouldFilter: undefined,
+    profileEnv: undefined,
+    readonlyMode: false,
+    localCliEnabled: false,
+  };
+
+  it("renders the granted groups", () => {
+    assert.equal(formatBannerFilterSuffix({ ...base, writeGroups: ["devices", "keys"] }), "write=devices,keys");
+  });
+
+  it("distinguishes a configured-but-empty grant from an unset knob", () => {
+    // `write=none` is a deliberate lockdown; no segment at all is today's default.
+    // An operator debugging "why can it not write" needs to tell those apart.
+    assert.equal(formatBannerFilterSuffix({ ...base, writeGroups: [] }), "write=none");
+    assert.equal(formatBannerFilterSuffix({ ...base, writeGroups: undefined }), "");
+  });
+
+  it("names readonly as the cause when it overrode a grant", () => {
+    assert.equal(
+      formatBannerFilterSuffix({
+        ...base,
+        readonlyMode: true,
+        writeGroups: [],
+        writeGroupsOverriddenByReadonly: true,
+      }),
+      "readonly (TAILSCALE_WRITE_GROUPS ignored), write=none",
+    );
+  });
+
+  it("keeps the bare readonly wording when no grant was overridden", () => {
+    assert.equal(formatBannerFilterSuffix({ ...base, readonlyMode: true }), "readonly");
+  });
+
+  it("composes with the group and profile segments", () => {
+    assert.equal(
+      formatBannerFilterSuffix({
+        ...base,
+        profileEnv: "core",
+        profileWouldFilter: true,
+        writeGroups: ["devices"],
+        localCliEnabled: true,
+      }),
+      "profile=core, write=devices, local-cli=on",
+    );
+  });
+});
+
+describe("conditionally-registered groups", () => {
+  it("registers exactly one group behind an opt-in, so the not-enabled remedy stays correct", () => {
+    // A TRIPWIRE, not a repair. index.ts DERIVES the not-enabled set (diff the default
+    // registry against one built with every opt-in on) but its remedy sentence
+    // hardcodes "Set TAILSCALE_LOCAL_CLI=1". A second conditional group would be
+    // DETECTED correctly and then handed the WRONG FIX -- and the comment there claims
+    // such a group is "covered without touching this branch", which is only half true.
+    // If this goes red, that message needs to name the right variable per group.
+    const withOptIns = Object.keys(buildToolGroups({ TAILSCALE_LOCAL_CLI: "1" }));
+    const byDefault = Object.keys(buildToolGroups({}));
+    assert.deepEqual(
+      withOptIns.filter((g) => !byDefault.includes(g)),
+      ["local-cli"],
+      "a new opt-in group needs its own remedy text in index.ts's not-enabled warning",
+    );
+  });
+
+  it("treats a granted local-cli as a legal no-op once the opt-in is on", () => {
+    // The mirror of the not-enabled branch: same group name, opposite message. The
+    // condition choosing between "not enabled" and "fine, nothing to do" is the only
+    // thing separating a helpful diagnostic from a wrong one.
+    const groups = buildToolGroups({ TAILSCALE_LOCAL_CLI: "1" });
+    const r = filterTools(groups, { writeGroups: "local-cli" });
+    assert.deepEqual(r.writeGroups, ["local-cli"], "a real, loaded group -- the grant applies");
+    assert.equal(r.unknownWriteGroups, undefined, "not a typo once the opt-in is on");
+    assert.equal(r.writeGroupsNotLoaded, undefined, "it loaded");
+    assert.deepEqual(
+      r.tools.filter((t) => t.annotations.readOnlyHint !== true),
+      [],
+      "all six local-CLI diagnostics are reads, so the grant serves no writes",
+    );
   });
 });
