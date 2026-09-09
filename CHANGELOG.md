@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > theory that its absence had degraded that release's notes. Keep entries here
 > current for readers; it will not change what `gh release` shows.
 
-## [Unreleased]
+## [0.19.1] — 2026-09-09
 
 ### Fixed
 - **`tailscale_diff_acl_access` now detects a posture DEFINITION change, which it previously reported as "unchanged".** Tightening `posture:corp` from `["node:os == 'macos'"]` to also require a client version changes who can reach every posture-gated destination, but the posture NAME on every match stays byte-identical -- so the diff keyed on names alone and returned a clean result for the whole tailnet at once. That is a silent false-clean on the one tool whose entire value is being believed, and 0.19.0 shipped it as a documented limitation.
