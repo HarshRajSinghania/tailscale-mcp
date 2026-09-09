@@ -133,22 +133,40 @@ if (!cliSubcommandHandled) {
 
   if (unknownWriteGroups && unknownWriteGroups.length > 0) {
     const validNames = Object.keys(toolGroups);
-    // No fallback here, unlike TAILSCALE_TOOLS: an unrecognised name grants nothing.
-    // Say so explicitly, because the safe outcome and a broken config look identical
-    // from the agent's side -- it just sees fewer tools.
-    const sentinels = new Set(["none", "off", "false", "0", "all", "*"]);
-    const guessed = unknownWriteGroups.filter((g) => sentinels.has(g.toLowerCase()));
-    // Nothing is reserved in the grammar (a reserved word could collide with a future
-    // group name), so a plausible-looking sentinel lands here as an unknown name. Point
-    // at the spelling that does what they meant rather than adding grammar for it.
-    const hint = guessed.some((g) => ["all", "*"].includes(g.toLowerCase()))
-      ? ' Note: "all" is not a group name -- leave TAILSCALE_WRITE_GROUPS unset to allow writes in every loaded group.'
-      : guessed.length > 0
-        ? " Note: to disable writes entirely, TAILSCALE_READONLY=1 is the shipped spelling."
-        : "";
-    console.error(
-      `@yawlabs/tailscale-mcp: TAILSCALE_WRITE_GROUPS includes unknown group(s): ${unknownWriteGroups.join(", ")}. Valid groups: ${validNames.join(", ")}. Those names granted no write access; tools outside the granted groups are served read-only.${hint}`,
-    );
+    // A group that EXISTS but is not registered in this process is not a typo, and
+    // telling the operator to check their spelling sends them hunting a mistake that
+    // is not there -- the same misattribution the unknownGroups / unknownProfileGroups
+    // split above exists to prevent. The conditional set is DERIVED (build the registry
+    // with every opt-in on and diff it) rather than hard-coding "local-cli", so a
+    // second conditional group is covered without touching this branch.
+    const everyPossibleGroup = Object.keys(buildToolGroups({ ...process.env, TAILSCALE_LOCAL_CLI: "1" }));
+    const notEnabled = unknownWriteGroups.filter((g) => everyPossibleGroup.includes(g));
+    const realTypos = unknownWriteGroups.filter((g) => !everyPossibleGroup.includes(g));
+    if (notEnabled.length > 0) {
+      console.error(
+        `@yawlabs/tailscale-mcp: TAILSCALE_WRITE_GROUPS names group(s) that exist but are not enabled in this process: ${notEnabled.join(", ")}. Set TAILSCALE_LOCAL_CLI=1 to register the local-cli group. Not a typo -- the grant simply had nothing to apply to.`,
+      );
+    }
+    // Only the names the branch above did NOT account for are typos. Reporting the
+    // full list here as "unknown" would contradict the message just printed.
+    if (realTypos.length > 0) {
+      // No fallback here, unlike TAILSCALE_TOOLS: an unrecognised name grants nothing.
+      // Say so explicitly, because the safe outcome and a broken config look identical
+      // from the agent's side -- it just sees fewer tools.
+      const sentinels = new Set(["none", "off", "false", "0", "all", "*"]);
+      const guessed = realTypos.filter((g) => sentinels.has(g.toLowerCase()));
+      // Nothing is reserved in the grammar (a reserved word could collide with a future
+      // group name), so a plausible-looking sentinel lands here as an unknown name.
+      // Point at the spelling that does what they meant rather than adding grammar.
+      const hint = guessed.some((g) => ["all", "*"].includes(g.toLowerCase()))
+        ? ' Note: "all" is not a group name -- leave TAILSCALE_WRITE_GROUPS unset to allow writes in every loaded group.'
+        : guessed.length > 0
+          ? " Note: to disable writes entirely, TAILSCALE_READONLY=1 is the shipped spelling."
+          : "";
+      console.error(
+        `@yawlabs/tailscale-mcp: TAILSCALE_WRITE_GROUPS includes unknown group(s): ${realTypos.join(", ")}. Valid groups: ${validNames.join(", ")}. Those names granted no write access; tools outside the granted groups are served read-only.${hint}`,
+      );
+    }
   }
 
   // A separate warning from the typo case on purpose: these names are spelled
@@ -286,23 +304,6 @@ if (!cliSubcommandHandled) {
     writeGroupsOverriddenByReadonly,
   });
 
-  // Not folded into the one-line banner: formatBannerFilterSuffix stays a small pure
-  // function, and this needs room to be specific. Fires only when the grant actually
-  // includes an admin-equivalent area, so it does not become background noise.
-  //
-  // The honest framing this exists to deliver: TAILSCALE_WRITE_GROUPS filters the TOOL
-  // LIST, not the credential. A grant to any of these three is tailnet-admin-equivalent
-  // regardless of what the other groups are set to.
-  const ADMIN_EQUIVALENT = ["keys", "users", "acl"];
-  const adminGrants = (writeGroups ?? []).filter((g) => ADMIN_EQUIVALENT.includes(g));
-  if (adminGrants.length > 0) {
-    console.error(
-      `@yawlabs/tailscale-mcp: note -- a write grant to ${adminGrants.join(", ")} is tailnet-admin-equivalent. ` +
-        "tailscale_create_key mints an OAuth client with any scopes the caller asks for, " +
-        'tailscale_update_user_role accepts "owner", and tailscale_update_acl rewrites policy for every principal. ' +
-        "Scope the Tailscale OAuth client itself to the same areas -- that bound survives outside this process; this one does not.",
-    );
-  }
   console.error(
     `@yawlabs/tailscale-mcp v${version} ready (${allTools.length} tools${filterSuffix ? `, ${filterSuffix}` : ""})`,
   );
@@ -312,6 +313,37 @@ if (!cliSubcommandHandled) {
   const hasCreds =
     !!process.env.TAILSCALE_API_KEY ||
     (!!process.env.TAILSCALE_OAUTH_CLIENT_ID && !!process.env.TAILSCALE_OAUTH_CLIENT_SECRET);
+
+  // Not folded into the one-line banner: formatBannerFilterSuffix stays a small pure
+  // function, and this needs room to be specific.
+  //
+  // Derived from what ACTUALLY REGISTERED, not from the write grant. An earlier
+  // revision read `writeGroups`, which inverted the warning relative to the risk: it
+  // fired on a NARROWED grant (`TAILSCALE_WRITE_GROUPS=keys`) and stayed silent on the
+  // default, where keys AND users AND acl are all writable because no gate is set. The
+  // operator in the more permissive state heard less. Asking the registered tool list
+  // "which admin-equivalent areas can this server write to right now" answers the same
+  // question in every configuration, and cannot drift from the config logic above
+  // because it does not re-derive it.
+  //
+  // The framing it exists to deliver: TAILSCALE_WRITE_GROUPS filters the TOOL LIST, not
+  // the credential. Writing in any of these three is tailnet-admin-equivalent.
+  const ADMIN_EQUIVALENT = ["keys", "users", "acl"];
+  const registeredNames = new Set(allTools.map((t) => t.name));
+  const adminWritable = ADMIN_EQUIVALENT.filter((g) =>
+    (toolGroups[g] ?? []).some((t) => t.annotations.readOnlyHint !== true && registeredNames.has(t.name)),
+  );
+  // Gated on hasCreds for the same reason as the profile tip: a fresh install with no
+  // credentials has a more useful first message to read than a security note.
+  if (adminWritable.length > 0 && hasCreds) {
+    console.error(
+      `@yawlabs/tailscale-mcp: note -- this server can write to ${adminWritable.join(", ")}, which is tailnet-admin-equivalent. ` +
+        "tailscale_create_key mints an OAuth client with any scopes the caller asks for, " +
+        'tailscale_update_user_role accepts "owner", and tailscale_update_acl rewrites policy for every principal. ' +
+        "Scope the Tailscale OAuth client itself to the areas you need -- that bound survives outside this process; this one does not. " +
+        "TAILSCALE_WRITE_GROUPS narrows what this server exposes.",
+    );
+  }
   if (!filterSuffix && hasCreds) {
     // Compute the per-profile counts from the actual registry rather than
     // hard-coding numbers in the banner string. The hard-coded form silently

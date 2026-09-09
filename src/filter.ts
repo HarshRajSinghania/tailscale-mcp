@@ -229,12 +229,16 @@ export function filterTools<T extends Annotated>(
   if (writeScope) {
     const loaded = [...writeScope].filter((g) => !enabledGroups || enabledGroups.has(g));
     result.writeGroups = readonly ? [] : loaded.sort();
-    const notLoaded = [...writeScope].filter((g) => enabledGroups && !enabledGroups.has(g));
-    if (notLoaded.length > 0) result.writeGroupsNotLoaded = notLoaded.sort();
     // Only flag the override when a grant was actually overridden: READONLY=1 with an
     // all-typo grant already yields nothing, and blaming readonly there would point the
     // operator at the wrong knob.
-    if (readonly && writeScope.size > 0) result.writeGroupsOverriddenByReadonly = true;
+    const overridden = readonly && writeScope.size > 0;
+    if (overridden) result.writeGroupsOverriddenByReadonly = true;
+    // Exactly ONE cause is reported. Under readonly the grant was void before the load
+    // filter could matter, so also saying "you named an unloaded group" would hand the
+    // operator two fixes for a config where neither name is the operative problem.
+    const notLoaded = overridden ? [] : [...writeScope].filter((g) => enabledGroups && !enabledGroups.has(g));
+    if (notLoaded.length > 0) result.writeGroupsNotLoaded = notLoaded.sort();
   }
   if (unknownWriteGroups.length > 0) result.unknownWriteGroups = unknownWriteGroups;
   return result;

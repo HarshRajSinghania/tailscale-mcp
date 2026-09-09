@@ -610,15 +610,69 @@ describe("TAILSCALE_WRITE_GROUPS wiring", () => {
     assert.match(stderr, /readonly \(TAILSCALE_WRITE_GROUPS ignored\)/);
   });
 
-  it("warns that a keys, users or acl grant is admin-equivalent", async () => {
+  it("warns that writing keys, users or acl is admin-equivalent", async () => {
     // The single most important line this feature prints: the knob filters the tool
     // list, not the credential, and these three areas are tailnet-admin-equivalent.
     const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "keys" });
-    assert.match(stderr, /a write grant to keys is tailnet-admin-equivalent/);
+    assert.match(stderr, /can write to keys, which is tailnet-admin-equivalent/);
     assert.match(stderr, /Scope the Tailscale OAuth client itself/);
-    // Silent when the grant is not admin-equivalent, so it does not become noise.
+    // Silent when the grant excludes all three, so it does not become noise.
     const quiet = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "devices" });
     assert.ok(!/admin-equivalent/.test(quiet), "must not fire on a non-admin grant");
+  });
+
+  it("warns on the UNGATED default too, where all three are writable", async () => {
+    // The warning is derived from what actually registered, not from the grant. An
+    // earlier revision read `writeGroups` and so inverted the signal relative to the
+    // risk: it fired on a NARROWED grant and stayed silent on the default, where keys
+    // AND users AND acl are all writable. The operator in the more permissive state
+    // heard less.
+    const stderr = await captureStartup({ ...API_KEY });
+    assert.match(stderr, /can write to keys, users, acl, which is tailnet-admin-equivalent/);
+  });
+
+  it("stays quiet about admin equivalence with no credentials, and under readonly", async () => {
+    // No creds: a fresh install has a more useful first message to read (the auth
+    // error on the first tool call), same gate as the profile tip.
+    const noCreds = await captureStartup({ TAILSCALE_WRITE_GROUPS: "keys" });
+    assert.ok(!/admin-equivalent/.test(noCreds), "a fresh install must not get a security lecture first");
+    // Readonly: nothing is writable, so there is nothing to warn about.
+    const ro = await captureStartup({ ...API_KEY, TAILSCALE_READONLY: "1" });
+    assert.ok(!/admin-equivalent/.test(ro), "readonly writes nothing");
+  });
+
+  it("distinguishes a group that exists but is not enabled from a typo", async () => {
+    // local-cli is a real group that only registers under TAILSCALE_LOCAL_CLI=1.
+    // Reporting it as "unknown" alongside a list of valid groups that excludes it
+    // sends the operator hunting a misspelling that does not exist -- the same
+    // misattribution the unknownGroups / unknownProfileGroups split exists to prevent.
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "local-cli" });
+    assert.match(stderr, /exist but are not enabled in this process: local-cli/);
+    assert.match(stderr, /Set TAILSCALE_LOCAL_CLI=1/);
+    assert.ok(!/includes unknown group/.test(stderr), "a real group name is not a typo");
+  });
+
+  it("reports a real typo and a not-enabled group as separate causes in one run", async () => {
+    const stderr = await captureStartup({ ...API_KEY, TAILSCALE_WRITE_GROUPS: "local-cli,devises" });
+    assert.match(stderr, /not enabled in this process: local-cli/);
+    assert.match(stderr, /includes unknown group\(s\): devises/);
+    // The typo warning must name ONLY the typo -- listing local-cli there would
+    // contradict the line printed immediately above it.
+    assert.ok(!/unknown group\(s\): local-cli/.test(stderr), "the two causes must not overlap");
+  });
+
+  it("names exactly one cause when readonly voids a grant that also named an unloaded group", async () => {
+    // Readonly voided the grant before the load filter could matter, so also saying
+    // "you named an unloaded group" hands the operator two fixes for a config where
+    // neither name is the operative problem.
+    const stderr = await captureStartup({
+      ...API_KEY,
+      TAILSCALE_READONLY: "1",
+      TAILSCALE_TOOLS: "acl",
+      TAILSCALE_WRITE_GROUPS: "dns",
+    });
+    assert.match(stderr, /readonly \(TAILSCALE_WRITE_GROUPS ignored\)/);
+    assert.ok(!/had no effect/.test(stderr), "readonly is the single operative cause");
   });
 
   it("changes nothing when unset", async () => {
